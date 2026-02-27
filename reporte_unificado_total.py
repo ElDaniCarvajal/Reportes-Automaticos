@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 """reporte_unificado_total.py
 
 Unificación de:
@@ -23,8 +25,6 @@ def _log(component: str, level: str, msg: str) -> None:
 # TENABLE (unificado)
 # =====================
 # -*- coding: utf-8 -*-
-
-from __future__ import annotations
 
 import os
 import sys
