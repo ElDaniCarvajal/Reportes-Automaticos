@@ -72,6 +72,7 @@ def _fmt_context(**kwargs) -> str:
 import os
 import sys
 import unicodedata
+import requests
 from types import MappingProxyType
 from typing import Dict, Any, Callable, Optional, List, Tuple
 
@@ -502,24 +503,27 @@ def run_all() -> Dict[str, Any]:
     try:
         t0 = time.perf_counter()
         _log("TENABLE", "INFO", "Ejecutando cis-host-audits.")
-        ns = _load_embedded_module("controlesCIS")
-
-        # Reutiliza el listado de tags ya consultado en cis-controls (evita otra llamada a /tags/values)
-        if cached_tags:
-            ns["discover_all_tags"] = (lambda _session, _t=cached_tags: _t)
-
-        dataset_path = os.path.join(base_out, "compliance_export_all.jsonl.gz")
-
-        if os.path.isfile(dataset_path):
-            rc = _run_controlesCIS_from_cached_export(ns, dataset_path, base_out, rows_to_show=12, assets_per_row=3)
+        if "controlesCIS" not in MODULE_SOURCES:
+            _log("TENABLE", "WARN", "Módulo embebido 'controlesCIS' no disponible; se omite cis-host-audits.")
         else:
-            # Fallback (si cis-controls falló): aquí sí hará export (solo para no dejarte sin imágenes)
-            _log("TENABLE", "WARN", "No existe compliance_export_all.jsonl.gz; se hará export directo (fallback).")
-            rc = _run_module(ns)
+            ns = _load_embedded_module("controlesCIS")
 
-        if rc != 0:
-            rc_total = rc_total or rc
-            _log("TENABLE", "WARN", f"cis-host-audits terminó con código {rc}")
+            # Reutiliza el listado de tags ya consultado en cis-controls (evita otra llamada a /tags/values)
+            if cached_tags and "discover_all_tags" in ns:
+                ns["discover_all_tags"] = (lambda _session, _t=cached_tags: _t)
+
+            dataset_path = os.path.join(base_out, "compliance_export_all.jsonl.gz")
+
+            if os.path.isfile(dataset_path):
+                rc = _run_controlesCIS_from_cached_export(ns, dataset_path, base_out, rows_to_show=12, assets_per_row=3)
+            else:
+                # Fallback (si cis-controls falló): aquí sí hará export (solo para no dejarte sin imágenes)
+                _log("TENABLE", "WARN", "No existe compliance_export_all.jsonl.gz; se hará export directo (fallback).")
+                rc = _run_module(ns)
+
+            if rc != 0:
+                rc_total = rc_total or rc
+                _log("TENABLE", "WARN", f"cis-host-audits terminó con código {rc}")
     except Exception as e:
         rc_total = rc_total or 1
         _log_exception("TENABLE", "cis-host-audits", e)
