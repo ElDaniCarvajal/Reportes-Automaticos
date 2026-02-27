@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 """reporte_unificado_total.py
 
 Unificación de:
