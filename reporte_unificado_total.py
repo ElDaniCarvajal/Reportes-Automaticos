@@ -145,6 +145,36 @@ def _iter_tag_dirs(base_out: str):
                 yield val_dir
 
 
+def _count_png_files(root_dir: str) -> int:
+    total = 0
+    if not root_dir or not os.path.isdir(root_dir):
+        return total
+    for current_root, _, files in os.walk(root_dir):
+        for name in files:
+            if name.lower().endswith(".png"):
+                total += 1
+    return total
+
+
+def _fmt_duration(seconds: float) -> str:
+    total = max(0, int(round(float(seconds))))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _fmt_utc(ts: datetime) -> str:
+    return ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _append_error(errors: List[Dict[str, str]], group: str, endpoint: str, exc: Exception) -> None:
+    errors.append({
+        "group": group,
+        "endpoint": endpoint,
+        "exception": f"{type(exc).__name__}: {exc}",
+    })
+
+
 
 def _iter_jsonl_gz_records(path: str):
     """Itera records (dict) desde un .jsonl.gz (1 JSON por línea)."""
@@ -232,7 +262,9 @@ def _run_controlesCIS_from_cached_export(ns, dataset_path: str, base_out: str,
     return 0
 
 
-def _run_tenable_images_per_tag(base_out: str) -> int:
+def _run_tenable_images_per_tag(base_out: str,
+                                errors: Optional[List[Dict[str, str]]] = None,
+                                group_timings: Optional[Dict[str, float]] = None) -> int:
     """
     Ejecuta el módulo 'Tenable_images - funciona.py' pero guardando
     sus 3 imágenes dentro de la carpeta del TAG: base_out/<cat>/<val>/.
@@ -278,6 +310,7 @@ def _run_tenable_images_per_tag(base_out: str) -> int:
         val = t.get("tag_value", "")
         tag_label = f"{cat} = {val}"
         print(f"[{i}/{len(targets)}] (vm-vulns) Procesando {tag_label}")
+        t0 = time.perf_counter()
 
         try:
             res = process_tag(sess, t)
@@ -306,6 +339,11 @@ def _run_tenable_images_per_tag(base_out: str) -> int:
 
         except Exception as e:
             print(f"  [ERR] {e}")
+            if errors is not None:
+                _append_error(errors, tag_label, "vm-vulns", e)
+        finally:
+            if group_timings is not None:
+                group_timings[tag_label] = time.perf_counter() - t0
 
         if sleep_s and sleep_s > 0:
             time.sleep(float(sleep_s))
@@ -314,7 +352,7 @@ def _run_tenable_images_per_tag(base_out: str) -> int:
     return 0
 
 
-def run_all() -> int:
+def run_all() -> Dict[str, Any]:
     base_out = _unified_out_dir()
     os.makedirs(base_out, exist_ok=True)
 
@@ -325,9 +363,13 @@ def run_all() -> int:
 
     rc_total = 0
     cached_tags = None  # se reutiliza entre módulos CIS (evita llamadas duplicadas a /tags/values)
+    errors: List[Dict[str, str]] = []
+    module_durations: Dict[str, float] = {}
+    vm_group_durations: Dict[str, float] = {}
 
     # 1) CIS controls (2 imgs + CSV por TAG)
     try:
+        t0 = time.perf_counter()
         _log("TENABLE", "INFO", "Ejecutando cis-controls.")
         ns = _load_embedded_module("cis_audit_charts")
 
@@ -353,9 +395,13 @@ def run_all() -> int:
     except Exception as e:
         rc_total = rc_total or 1
         _log("TENABLE", "ERROR", f"cis-controls error: {e}")
+        _append_error(errors, "Tenable", "cis-controls", e)
+    finally:
+        module_durations["cis-controls"] = time.perf_counter() - t0
 
     # 2) CIS host audits (2 imgs por TAG) -> REUSA el export ya descargado (sin volver a bajar chunks)
     try:
+        t0 = time.perf_counter()
         _log("TENABLE", "INFO", "Ejecutando cis-host-audits.")
         ns = _load_embedded_module("controlesCIS")
 
@@ -378,21 +424,29 @@ def run_all() -> int:
     except Exception as e:
         rc_total = rc_total or 1
         _log("TENABLE", "ERROR", f"cis-host-audits error: {e}")
+        _append_error(errors, "Tenable", "cis-host-audits", e)
+    finally:
+        module_durations["cis-host-audits"] = time.perf_counter() - t0
 
 # 3) VM vulns (severidad + top10 + spotlight) -> guardando dentro de carpeta del TAG
     try:
+        t0 = time.perf_counter()
         _log("TENABLE", "INFO", "Ejecutando vm-vulns.")
-        rc = _run_tenable_images_per_tag(base_out)
+        rc = _run_tenable_images_per_tag(base_out, errors=errors, group_timings=vm_group_durations)
         if rc != 0:
             rc_total = rc_total or rc
             _log("TENABLE", "WARN", f"vm-vulns terminó con código {rc}")
     except Exception as e:
         rc_total = rc_total or 1
         _log("TENABLE", "ERROR", f"vm-vulns error: {e}")
+        _append_error(errors, "Tenable", "vm-vulns", e)
+    finally:
+        module_durations["vm-vulns"] = time.perf_counter() - t0
 
     # 4) Identity donuts (1 imagen) -> la copiamos dentro de CADA carpeta de TAG
     identity_path = os.path.join(base_out, "identity_exposure_donuts_4k.png")
     try:
+        t0 = time.perf_counter()
         _log("TENABLE", "INFO", "Ejecutando identity.")
         ns = _load_embedded_module("tenable_identity")
 
@@ -406,6 +460,9 @@ def run_all() -> int:
     except Exception as e:
         rc_total = rc_total or 1
         _log("TENABLE", "ERROR", f"identity error: {e}")
+        _append_error(errors, "Tenable", "identity", e)
+    finally:
+        module_durations["identity"] = time.perf_counter() - t0
 
     # Copiar identity a todas las carpetas de tag (si existe)
     try:
@@ -420,11 +477,22 @@ def run_all() -> int:
     except Exception:
         pass
 
+    groups_processed = sum(1 for _ in _iter_tag_dirs(base_out))
+    images_generated = _count_png_files(base_out)
+
     _log("TENABLE", "OK", f"Proceso Tenable finalizado. {_fmt_context(output_dir=base_out)}")
-    return rc_total
+    return {
+        "rc": int(rc_total),
+        "root_dirs": [base_out],
+        "groups_processed": groups_processed,
+        "images_generated": images_generated,
+        "errors": errors,
+        "module_durations": module_durations,
+        "group_durations": vm_group_durations,
+    }
 
 
-def tenable_main() -> int:
+def tenable_main() -> Dict[str, Any]:
     # Ignoramos cualquier argumento: el usuario pidió ejecución 100% automática.
     return run_all()
 
@@ -1563,6 +1631,9 @@ def amp_main():
     range_end = iso_utc_compromises(end_utc)
 
     groups = amp.get_groups()
+    errors: List[Dict[str, str]] = []
+    group_durations: Dict[str, float] = {}
+    images_generated = 0
     _log("AMP", "INFO", f"Grupos detectados. {_fmt_context(count=len(groups), output_dir=out_root)}")
     _log("AMP", "INFO", f"Rango UTC (events). {_fmt_context(start=range_start, end=range_end)}")
 
@@ -1579,6 +1650,7 @@ def amp_main():
         safe_name = sanitize_folder(gname)
         out_dir = os.path.join(out_root, safe_name)
         ensure_dir(out_dir)
+        g_t0 = time.perf_counter()
 
         # 1) COMPROMISES -> compromises.png
         try:
@@ -1596,6 +1668,7 @@ def amp_main():
             _log("AMP", "OK", f"Compromises procesado. {_fmt_context(group=gname, date_range=f'{range_start}..{range_end}', count=len(compromise_events), output=out_img_comp)}")
         except Exception as e:
             _log("AMP", "ERROR", f"Error en compromises. {_fmt_context(group=gname, date_range=f'{range_start}..{range_end}', output_dir=out_dir, error=e)}")
+            _append_error(errors, gname, "compromises", e)
 
         # 2) THREATS -> threats.png
         try:
@@ -1608,6 +1681,7 @@ def amp_main():
             _log("AMP", "OK", f"Threats procesado. {_fmt_context(group=gname, date_range=f'{range_start}..{range_end}', count=len(threats), output=out_img_thr)}")
         except Exception as e:
             _log("AMP", "ERROR", f"Error en threats. {_fmt_context(group=gname, date_range=f'{range_start}..{range_end}', output_dir=out_dir, error=e)}")
+            _append_error(errors, gname, "threats", e)
 
         # 3) DEVICES -> devices.png
         try:
@@ -1634,49 +1708,103 @@ def amp_main():
                 _log("AMP", "OK", f"Devices procesado. {_fmt_context(group=gname, endpoints=len(endpoints), windows=len(windows_eps), supported=sup, unsupported=uns, output=out_img_dev)}")
         except Exception as e:
             _log("AMP", "ERROR", f"Error en devices. {_fmt_context(group=gname, output_dir=out_dir, error=e)}")
+            _append_error(errors, gname, "devices", e)
+
+        generated_here = 0
+        for img_name in ("compromises.png", "threats.png", "devices.png"):
+            if os.path.isfile(os.path.join(out_dir, img_name)):
+                generated_here += 1
+        images_generated += generated_here
+        group_durations[gname] = time.perf_counter() - g_t0
 
         time.sleep(GROUP_THROTTLE_SECONDS)
 
     _log("AMP", "OK", f"Proceso AMP finalizado. {_fmt_context(output_dir=out_root)}")
+    return {
+        "rc": 0,
+        "root_dirs": [out_root],
+        "groups_processed": len(groups),
+        "images_generated": images_generated,
+        "errors": errors,
+        "group_durations": group_durations,
+    }
 
 
 # =====================
 # ORQUESTADOR
 # =====================
 
-def run_tenable() -> int:
+def run_tenable() -> Dict[str, Any]:
     """Ejecuta Tenable con logging unificado."""
     _log("TENABLE", "INFO", "Iniciando generación de reportes Tenable.")
     try:
-        rc = tenable_main()
+        data = tenable_main()
     except Exception as e:
         _log("TENABLE", "ERROR", f"Error ejecutando Tenable: {e}")
-        return 1
+        return {"rc": 1, "root_dirs": [], "groups_processed": 0, "images_generated": 0, "errors": [{"group": "Tenable", "endpoint": "run_tenable", "exception": f"{type(e).__name__}: {e}"}], "module_durations": {}, "group_durations": {}}
+
+    rc = int(data.get("rc", 1))
 
     if rc:
         _log("TENABLE", "WARN", f"Tenable finalizó con código no-cero. {_fmt_context(rc=rc)}")
     else:
         _log("TENABLE", "OK", "Tenable finalizado correctamente.")
-    return int(rc)
+    data["rc"] = rc
+    return data
 
 
-def run_amp() -> int:
+def run_amp() -> Dict[str, Any]:
     """Ejecuta Cisco AMP con logging unificado."""
     _log("AMP", "INFO", "Iniciando generación de reportes Cisco AMP.")
     try:
-        amp_main()
+        data = amp_main()
     except Exception as e:
         _log("AMP", "ERROR", f"Error ejecutando AMP: {e}")
-        return 1
+        return {"rc": 1, "root_dirs": [], "groups_processed": 0, "images_generated": 0, "errors": [{"group": "AMP", "endpoint": "run_amp", "exception": f"{type(e).__name__}: {e}"}], "group_durations": {}}
 
     _log("AMP", "OK", "Cisco AMP finalizado correctamente.")
-    return 0
+    data["rc"] = int(data.get("rc", 0))
+    return data
+
+
+def _log_summary(start_dt: datetime, end_dt: datetime, tenable_data: Dict[str, Any], amp_data: Dict[str, Any]) -> None:
+    total_seconds = (end_dt - start_dt).total_seconds()
+    all_errors = list(tenable_data.get("errors", [])) + list(amp_data.get("errors", []))
+
+    _log("SUMMARY", "INFO", "========== RESUMEN ==========")
+    _log("SUMMARY", "INFO", f"Inicio: {_fmt_utc(start_dt)}")
+    _log("SUMMARY", "INFO", f"Fin: {_fmt_utc(end_dt)}")
+    _log("SUMMARY", "INFO", f"Duración total: {_fmt_duration(total_seconds)}")
+
+    tenable_roots = ", ".join(tenable_data.get("root_dirs", [])) or "-"
+    amp_roots = ", ".join(amp_data.get("root_dirs", [])) or "-"
+    _log("SUMMARY", "INFO", f"Tenable | grupos={tenable_data.get('groups_processed', 0)} | imágenes={tenable_data.get('images_generated', 0)} | raíces={tenable_roots}")
+    _log("SUMMARY", "INFO", f"AMP     | grupos={amp_data.get('groups_processed', 0)} | imágenes={amp_data.get('images_generated', 0)} | raíces={amp_roots}")
+
+    _log("SUMMARY", "INFO", f"Tiempo módulo Tenable: {_fmt_duration(sum(tenable_data.get('module_durations', {}).values()))}")
+    for name, secs in sorted(tenable_data.get("module_durations", {}).items()):
+        _log("SUMMARY", "INFO", f"  - Tenable/{name}: {_fmt_duration(secs)}")
+
+    _log("SUMMARY", "INFO", f"Tiempo módulo AMP: {_fmt_duration(sum(amp_data.get('group_durations', {}).values()))}")
+    for group, secs in sorted(amp_data.get("group_durations", {}).items()):
+        _log("SUMMARY", "INFO", f"  - AMP grupo '{group}': {_fmt_duration(secs)}")
+
+    _log("SUMMARY", "INFO", f"Errores totales: {len(all_errors)}")
+    for err in all_errors:
+        _log("SUMMARY", "INFO", f"  - grupo={err.get('group', '-')} | endpoint={err.get('endpoint', '-')} | excepción={err.get('exception', '-')}")
 
 
 def main() -> int:
     """Ejecuta Tenable y AMP en serie (siempre automático)."""
-    rc_tenable = run_tenable()
-    rc_amp = run_amp()
+    start_dt = datetime.now(timezone.utc)
+    rc_tenable_data = run_tenable()
+    rc_amp_data = run_amp()
+    end_dt = datetime.now(timezone.utc)
+
+    _log_summary(start_dt, end_dt, rc_tenable_data, rc_amp_data)
+
+    rc_tenable = int(rc_tenable_data.get("rc", 1))
+    rc_amp = int(rc_amp_data.get("rc", 1))
     rc_total = rc_tenable or rc_amp
     _log("ALL", "OK" if rc_total == 0 else "WARN", f"Proceso unificado finalizado. {_fmt_context(rc=rc_total)}")
     return int(rc_total)
