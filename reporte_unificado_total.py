@@ -15,8 +15,22 @@ Ejecución:
 """
 
 def _log(component: str, level: str, msg: str) -> None:
-    """Log estándar del orquestador (los módulos internos mantienen sus prints)."""
-    print(f"[{component}][{level}] {msg}")
+    """Log estándar unificado: [MODULO][NIVEL] mensaje."""
+    valid_levels = {"INFO", "OK", "WARN", "ERROR", "DEBUG"}
+    normalized_level = (level or "INFO").upper().strip()
+    if normalized_level not in valid_levels:
+        normalized_level = "INFO"
+    print(f"[{component}][{normalized_level}] {msg}")
+
+
+def _fmt_context(**kwargs) -> str:
+    """Formatea contexto opcional para logs sin alterar lógica funcional."""
+    items = []
+    for key, value in kwargs.items():
+        if value is None:
+            continue
+        items.append(f"{key}={value}")
+    return " | ".join(items)
 
 
 # =====================
@@ -24,12 +38,10 @@ def _log(component: str, level: str, msg: str) -> None:
 # =====================
 # -*- coding: utf-8 -*-
 
-from __future__ import annotations
-
 import os
 import sys
 from types import MappingProxyType
-from typing import Dict, Any, Callable, Optional
+from typing import Dict, Any, Callable, Optional, List, Tuple
 
 
 # =========================================================
@@ -309,17 +321,14 @@ def run_all() -> int:
     if not TENABLE_ACCESS_KEY or not TENABLE_SECRET_KEY:
         raise SystemExit("❌ Faltan variables de entorno: TENABLE_ACCESS_KEY y TENABLE_SECRET_KEY")
 
-    print("\n===============================")
-    print("Tenable Reportes Unificado (AUTO)")
-    print("===============================")
-    print(f"Salida: {base_out}\n")
+    _log("TENABLE", "INFO", f"Inicio Tenable unificado. {_fmt_context(output_dir=base_out)}")
 
     rc_total = 0
     cached_tags = None  # se reutiliza entre módulos CIS (evita llamadas duplicadas a /tags/values)
 
     # 1) CIS controls (2 imgs + CSV por TAG)
     try:
-        print("=== Ejecutando: cis-controls ===")
+        _log("TENABLE", "INFO", "Ejecutando cis-controls.")
         ns = _load_embedded_module("cis_audit_charts")
 
         # Cachea tags una sola vez (los 2 módulos CIS requieren el mismo listado)
@@ -340,14 +349,14 @@ def run_all() -> int:
         rc = _run_module(ns)
         if rc != 0:
             rc_total = rc_total or rc
-            print(f"[WARN] cis-controls terminó con código {rc}")
+            _log("TENABLE", "WARN", f"cis-controls terminó con código {rc}")
     except Exception as e:
         rc_total = rc_total or 1
-        print(f"[ERR] cis-controls: {e}")
+        _log("TENABLE", "ERROR", f"cis-controls error: {e}")
 
     # 2) CIS host audits (2 imgs por TAG) -> REUSA el export ya descargado (sin volver a bajar chunks)
     try:
-        print("\n=== Ejecutando: cis-host-audits ===")
+        _log("TENABLE", "INFO", "Ejecutando cis-host-audits.")
         ns = _load_embedded_module("controlesCIS")
 
         # Reutiliza el listado de tags ya consultado en cis-controls (evita otra llamada a /tags/values)
@@ -360,31 +369,31 @@ def run_all() -> int:
             rc = _run_controlesCIS_from_cached_export(ns, dataset_path, base_out, rows_to_show=12, assets_per_row=3)
         else:
             # Fallback (si cis-controls falló): aquí sí hará export (solo para no dejarte sin imágenes)
-            print("[WARN] No existe compliance_export_all.jsonl.gz; se hará export directo (fallback).")
+            _log("TENABLE", "WARN", "No existe compliance_export_all.jsonl.gz; se hará export directo (fallback).")
             rc = _run_module(ns)
 
         if rc != 0:
             rc_total = rc_total or rc
-            print(f"[WARN] cis-host-audits terminó con código {rc}")
+            _log("TENABLE", "WARN", f"cis-host-audits terminó con código {rc}")
     except Exception as e:
         rc_total = rc_total or 1
-        print(f"[ERR] cis-host-audits: {e}")
+        _log("TENABLE", "ERROR", f"cis-host-audits error: {e}")
 
 # 3) VM vulns (severidad + top10 + spotlight) -> guardando dentro de carpeta del TAG
     try:
-        print("\n=== Ejecutando: vm-vulns ===")
+        _log("TENABLE", "INFO", "Ejecutando vm-vulns.")
         rc = _run_tenable_images_per_tag(base_out)
         if rc != 0:
             rc_total = rc_total or rc
-            print(f"[WARN] vm-vulns terminó con código {rc}")
+            _log("TENABLE", "WARN", f"vm-vulns terminó con código {rc}")
     except Exception as e:
         rc_total = rc_total or 1
-        print(f"[ERR] vm-vulns: {e}")
+        _log("TENABLE", "ERROR", f"vm-vulns error: {e}")
 
     # 4) Identity donuts (1 imagen) -> la copiamos dentro de CADA carpeta de TAG
     identity_path = os.path.join(base_out, "identity_exposure_donuts_4k.png")
     try:
-        print("\n=== Ejecutando: identity ===")
+        _log("TENABLE", "INFO", "Ejecutando identity.")
         ns = _load_embedded_module("tenable_identity")
 
         # Unifica salida
@@ -393,10 +402,10 @@ def run_all() -> int:
         rc = _run_module(ns)
         if rc != 0:
             rc_total = rc_total or rc
-            print(f"[WARN] identity terminó con código {rc}")
+            _log("TENABLE", "WARN", f"identity terminó con código {rc}")
     except Exception as e:
         rc_total = rc_total or 1
-        print(f"[ERR] identity: {e}")
+        _log("TENABLE", "ERROR", f"identity error: {e}")
 
     # Copiar identity a todas las carpetas de tag (si existe)
     try:
@@ -407,12 +416,11 @@ def run_all() -> int:
                     shutil.copy2(identity_path, dst)
                 except Exception:
                     pass
-            print("\n[OK] identity_exposure_donuts_4k.png copiada a todas las carpetas de TAG.")
+            _log("TENABLE", "OK", "identity_exposure_donuts_4k.png copiada a todas las carpetas de TAG.")
     except Exception:
         pass
 
-    print("\n✅ Listo.")
-    print(f"✅ Carpeta final: {base_out}")
+    _log("TENABLE", "OK", f"Proceso Tenable finalizado. {_fmt_context(output_dir=base_out)}")
     return rc_total
 
 
@@ -438,15 +446,10 @@ Notes:
 - AMP API auth/session is shared in a single AmpClient.
 """
 
-import os
 import re
-import time
-import json
 import hashlib
 import datetime as dt
-from typing import Any, Dict, List, Tuple, Optional
 
-import requests
 from PIL import Image, ImageDraw, ImageFont
 
 # ============================================================
@@ -1556,15 +1559,18 @@ def amp_main():
     out_root = os.path.join(OUTPUT_ROOT, f"unificado_{ts}")
     ensure_dir(out_root)
 
+    range_start = iso_utc_compromises(start_utc)
+    range_end = iso_utc_compromises(end_utc)
+
     groups = amp.get_groups()
-    print(f"✅ Groups detectados: {len(groups)}")
-    print(f"✅ Rango UTC (events): start={iso_utc_compromises(start_utc)} | end={iso_utc_compromises(end_utc)}")
+    _log("AMP", "INFO", f"Grupos detectados. {_fmt_context(count=len(groups), output_dir=out_root)}")
+    _log("AMP", "INFO", f"Rango UTC (events). {_fmt_context(start=range_start, end=range_end)}")
 
     # Devices: prefetch computers una sola vez (igual que Amp_todo.py, pero compartiendo auth)
     computers = iter_all_computers(amp)
-    print(f"✅ Computers tenant: {len(computers)}")
+    _log("AMP", "INFO", f"Computers del tenant cargados. {_fmt_context(count=len(computers))}")
     membership_idx = build_group_membership_index(computers)
-    print(f"✅ Group membership index built: {len(membership_idx)} group IDs con endpoints")
+    _log("AMP", "DEBUG", f"Índice de membresía construido. {_fmt_context(groups_with_endpoints=len(membership_idx))}")
 
     for g in groups:
         gname = g["name"]
@@ -1587,9 +1593,9 @@ def amp_main():
             out_img_comp = os.path.join(out_dir, "compromises.png")
             render_compromises_card(compromise_events, out_img_comp)
 
-            print(f"✅ {gname}: compromises={len(compromise_events)} -> {out_img_comp}")
+            _log("AMP", "OK", f"Compromises procesado. {_fmt_context(group=gname, date_range=f'{range_start}..{range_end}', count=len(compromise_events), output=out_img_comp)}")
         except Exception as e:
-            print(f"⚠️ {gname}: error compromises ({e})")
+            _log("AMP", "ERROR", f"Error en compromises. {_fmt_context(group=gname, date_range=f'{range_start}..{range_end}', output_dir=out_dir, error=e)}")
 
         # 2) THREATS -> threats.png
         try:
@@ -1599,15 +1605,15 @@ def amp_main():
             out_img_thr = os.path.join(out_dir, "threats.png")
             render_threats_card(threats, out_img_thr)
 
-            print(f"✅ {gname}: threats={len(threats)} -> {out_img_thr}")
+            _log("AMP", "OK", f"Threats procesado. {_fmt_context(group=gname, date_range=f'{range_start}..{range_end}', count=len(threats), output=out_img_thr)}")
         except Exception as e:
-            print(f"⚠️ {gname}: error threats ({e})")
+            _log("AMP", "ERROR", f"Error en threats. {_fmt_context(group=gname, date_range=f'{range_start}..{range_end}', output_dir=out_dir, error=e)}")
 
         # 3) DEVICES -> devices.png
         try:
             endpoints = membership_idx.get(gguid, [])
             if not endpoints and not GENERATE_EMPTY_GROUPS:
-                print(f"⏭️ {gname}: sin endpoints (skip devices)")
+                _log("AMP", "WARN", f"Sin endpoints; devices omitido. {_fmt_context(group=gname, output_dir=out_dir)}")
             else:
                 os_buckets = [d_parse_os_bucket(c.get("operating_system")) for c in endpoints]
                 os_counts = d_count_top(os_buckets)
@@ -1625,46 +1631,54 @@ def amp_main():
                     empty_note=(len(endpoints) == 0),
                 )
 
-                print(f"✅ {gname}: devices endpoints={len(endpoints)} windows={len(windows_eps)} sup={sup} uns={uns} -> {out_img_dev}")
+                _log("AMP", "OK", f"Devices procesado. {_fmt_context(group=gname, endpoints=len(endpoints), windows=len(windows_eps), supported=sup, unsupported=uns, output=out_img_dev)}")
         except Exception as e:
-            print(f"⚠️ {gname}: error devices ({e})")
+            _log("AMP", "ERROR", f"Error en devices. {_fmt_context(group=gname, output_dir=out_dir, error=e)}")
 
         time.sleep(GROUP_THROTTLE_SECONDS)
 
-    print(f"✅ Listo. Carpeta final: {out_root}")
+    _log("AMP", "OK", f"Proceso AMP finalizado. {_fmt_context(output_dir=out_root)}")
 
 
 # =====================
 # ORQUESTADOR
 # =====================
 
-def main() -> int:
-    """Ejecuta Tenable y AMP en serie (por defecto)."""
-    rc_total = 0
-
-    # 1) Tenable
+def run_tenable() -> int:
+    """Ejecuta Tenable con logging unificado."""
+    _log("TENABLE", "INFO", "Iniciando generación de reportes Tenable.")
     try:
-        _log("TENABLE", "INFO", "Iniciando generación de reportes Tenable...")
         rc = tenable_main()
-        if rc:
-            rc_total = rc_total or rc
-            _log("TENABLE", "WARN", f"Terminó con código {rc}")
-        else:
-            _log("TENABLE", "OK", "Finalizado correctamente.")
     except Exception as e:
-        rc_total = rc_total or 1
-        _log("TENABLE", "ERR", f"Error ejecutando Tenable: {e}")
+        _log("TENABLE", "ERROR", f"Error ejecutando Tenable: {e}")
+        return 1
 
-    # 2) AMP
+    if rc:
+        _log("TENABLE", "WARN", f"Tenable finalizó con código no-cero. {_fmt_context(rc=rc)}")
+    else:
+        _log("TENABLE", "OK", "Tenable finalizado correctamente.")
+    return int(rc)
+
+
+def run_amp() -> int:
+    """Ejecuta Cisco AMP con logging unificado."""
+    _log("AMP", "INFO", "Iniciando generación de reportes Cisco AMP.")
     try:
-        _log("AMP", "INFO", "Iniciando generación de reportes Cisco AMP...")
         amp_main()
-        _log("AMP", "OK", "Finalizado correctamente.")
     except Exception as e:
-        rc_total = rc_total or 1
-        _log("AMP", "ERR", f"Error ejecutando AMP: {e}")
+        _log("AMP", "ERROR", f"Error ejecutando AMP: {e}")
+        return 1
 
-    _log("ALL", "OK" if rc_total == 0 else "WARN", f"Proceso unificado finalizado. rc={rc_total}")
+    _log("AMP", "OK", "Cisco AMP finalizado correctamente.")
+    return 0
+
+
+def main() -> int:
+    """Ejecuta Tenable y AMP en serie (siempre automático)."""
+    rc_tenable = run_tenable()
+    rc_amp = run_amp()
+    rc_total = rc_tenable or rc_amp
+    _log("ALL", "OK" if rc_total == 0 else "WARN", f"Proceso unificado finalizado. {_fmt_context(rc=rc_total)}")
     return int(rc_total)
 
 
