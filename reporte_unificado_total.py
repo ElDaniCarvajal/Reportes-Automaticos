@@ -14,13 +14,42 @@ Ejecución:
   python reporte_unificado_total.py
 """
 
+
+import traceback
+from typing import Optional
+
+_RUN_LOG_PATH: Optional[str] = None
+_ERROR_LOG_PATH: Optional[str] = None
+
+
 def _log(component: str, level: str, msg: str) -> None:
     """Log estándar unificado: [MODULO][NIVEL] mensaje."""
     valid_levels = {"INFO", "OK", "WARN", "ERROR", "DEBUG"}
     normalized_level = (level or "INFO").upper().strip()
     if normalized_level not in valid_levels:
         normalized_level = "INFO"
-    print(f"[{component}][{normalized_level}] {msg}")
+    line = f"[{component}][{normalized_level}] {msg}"
+    print(line)
+    if _RUN_LOG_PATH:
+        try:
+            with open(_RUN_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+
+def _log_exception(component: str, context: str, exc: Exception) -> None:
+    trace = traceback.format_exc()
+    _log(component, "ERROR", f"{context}: {exc}")
+    if _ERROR_LOG_PATH:
+        try:
+            with open(_ERROR_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"[{component}] {context}\n")
+                f.write(f"{type(exc).__name__}: {exc}\n")
+                f.write(trace.rstrip() + "\n")
+                f.write("-" * 80 + "\n")
+        except Exception:
+            pass
 
 
 def _fmt_context(**kwargs) -> str:
@@ -40,6 +69,7 @@ def _fmt_context(**kwargs) -> str:
 
 import os
 import sys
+import unicodedata
 from types import MappingProxyType
 from typing import Dict, Any, Callable, Optional, List, Tuple
 
@@ -106,16 +136,83 @@ import time
 import gzip
 import json
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 
-def _safe_fs_name(s: str) -> str:
-    """Misma lógica que los scripts originales (no cambia nombres salvo caracteres inválidos)."""
+def sanitize_name(s: str, max_len: int = 160, normalize_ascii: bool = True) -> str:
+    """Sanitiza nombres para filesystem (Windows/Linux) sin alterar etiquetas visibles."""
     import re as _re
     s = (s or "").strip()
+    if normalize_ascii:
+        s = unicodedata.normalize("NFKD", s)
+        s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = _re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", s)
     s = _re.sub(r"\s+", " ", s).strip()
     s = s.rstrip(". ")
-    return (s[:160] if len(s) > 160 else s) or "unnamed"
+    return (s[:max_len] if len(s) > max_len else s) or "unnamed"
+
+
+def _safe_fs_name(s: str) -> str:
+    """Alias legado para compatibilidad."""
+    return sanitize_name(s)
+
+
+def _init_log_paths() -> str:
+    global _RUN_LOG_PATH, _ERROR_LOG_PATH
+    now = datetime.now(timezone.utc)
+    month_dir = now.strftime("%Y-%m")
+    stamp_dir = now.strftime("%Y%m%d_%H%M%S")
+    log_dir = os.path.abspath(os.path.join("logs", month_dir, stamp_dir))
+    os.makedirs(log_dir, exist_ok=True)
+    _RUN_LOG_PATH = os.path.join(log_dir, "run.log")
+    _ERROR_LOG_PATH = os.path.join(log_dir, "errors.log")
+    return log_dir
+
+
+def _parse_retry_after(raw: Optional[str]) -> Optional[float]:
+    if not raw:
+        return None
+    raw = raw.strip()
+    try:
+        return max(0.0, float(raw))
+    except Exception:
+        pass
+    try:
+        target = parsedate_to_datetime(raw)
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        return max(0.0, (target - datetime.now(timezone.utc)).total_seconds())
+    except Exception:
+        return None
+
+
+def check_image(path: str, min_size_bytes: int = 5 * 1024, expected_size: Optional[Tuple[int, int]] = None) -> Tuple[bool, str]:
+    if not os.path.isfile(path):
+        return False, "archivo no existe"
+    size = os.path.getsize(path)
+    if size <= min_size_bytes:
+        return False, f"tamaño insuficiente: {size} bytes"
+    try:
+        with Image.open(path) as im:
+            im.verify()
+        with Image.open(path) as im:
+            if expected_size and im.size != expected_size:
+                return False, f"dimensiones inesperadas: {im.size}"
+    except Exception as e:
+        return False, f"PNG inválido: {e}"
+    return True, "ok"
+
+
+def render_empty_state(title: str, period: str, output_path: str, canvas_size: Tuple[int, int]) -> None:
+    img = Image.new("RGB", canvas_size, (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    d.rectangle([8, 8, canvas_size[0] - 8, canvas_size[1] - 8], outline=(230, 230, 230), width=3)
+    font_title = c_load_font(46) if canvas_size == (C_CARD_W, C_CARD_H) else d_load_font(46, bold=True)
+    font_body = c_load_font(24) if canvas_size == (C_CARD_W, C_CARD_H) else d_load_font(24)
+    d.text((40, 32), title, fill=(0, 120, 185), font=font_title)
+    d.text((40, int(canvas_size[1] * 0.45)), "Sin datos en el periodo", fill=(90, 90, 90), font=font_body)
+    d.text((40, int(canvas_size[1] * 0.45) + 36), period, fill=(120, 120, 120), font=font_body)
+    img.save(output_path, "PNG")
 
 
 def _unified_out_dir() -> str:
@@ -338,7 +435,7 @@ def _run_tenable_images_per_tag(base_out: str,
                 print(f"  [OK] total={res['total_vulns']} -> 03/04 (spotlight: none)")
 
         except Exception as e:
-            print(f"  [ERR] {e}")
+            _log_exception("TENABLE", f"vm-vulns tag={tag_label}", e)
             if errors is not None:
                 _append_error(errors, tag_label, "vm-vulns", e)
         finally:
@@ -394,7 +491,7 @@ def run_all() -> Dict[str, Any]:
             _log("TENABLE", "WARN", f"cis-controls terminó con código {rc}")
     except Exception as e:
         rc_total = rc_total or 1
-        _log("TENABLE", "ERROR", f"cis-controls error: {e}")
+        _log_exception("TENABLE", "cis-controls", e)
         _append_error(errors, "Tenable", "cis-controls", e)
     finally:
         module_durations["cis-controls"] = time.perf_counter() - t0
@@ -423,7 +520,7 @@ def run_all() -> Dict[str, Any]:
             _log("TENABLE", "WARN", f"cis-host-audits terminó con código {rc}")
     except Exception as e:
         rc_total = rc_total or 1
-        _log("TENABLE", "ERROR", f"cis-host-audits error: {e}")
+        _log_exception("TENABLE", "cis-host-audits", e)
         _append_error(errors, "Tenable", "cis-host-audits", e)
     finally:
         module_durations["cis-host-audits"] = time.perf_counter() - t0
@@ -438,7 +535,7 @@ def run_all() -> Dict[str, Any]:
             _log("TENABLE", "WARN", f"vm-vulns terminó con código {rc}")
     except Exception as e:
         rc_total = rc_total or 1
-        _log("TENABLE", "ERROR", f"vm-vulns error: {e}")
+        _log_exception("TENABLE", "vm-vulns", e)
         _append_error(errors, "Tenable", "vm-vulns", e)
     finally:
         module_durations["vm-vulns"] = time.perf_counter() - t0
@@ -459,7 +556,7 @@ def run_all() -> Dict[str, Any]:
             _log("TENABLE", "WARN", f"identity terminó con código {rc}")
     except Exception as e:
         rc_total = rc_total or 1
-        _log("TENABLE", "ERROR", f"identity error: {e}")
+        _log_exception("TENABLE", "identity", e)
         _append_error(errors, "Tenable", "identity", e)
     finally:
         module_durations["identity"] = time.perf_counter() - t0
@@ -476,6 +573,17 @@ def run_all() -> Dict[str, Any]:
             _log("TENABLE", "OK", "identity_exposure_donuts_4k.png copiada a todas las carpetas de TAG.")
     except Exception:
         pass
+
+    for current_root, _, files in os.walk(base_out):
+        for name in files:
+            if not name.lower().endswith(".png"):
+                continue
+            img_path = os.path.join(current_root, name)
+            ok, reason = check_image(img_path)
+            if not ok:
+                err = RuntimeError(f"check_image tenable: {reason}")
+                _log("TENABLE", "ERROR", f"Imagen inválida. {_fmt_context(path=img_path, reason=reason)}")
+                _append_error(errors, "Tenable", "check_image", err)
 
     groups_processed = sum(1 for _ in _iter_tag_dirs(base_out))
     images_generated = _count_png_files(base_out)
@@ -561,11 +669,7 @@ def ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
 def sanitize_folder(name: str) -> str:
-    name = (name or "").strip()
-    # compatible Windows/Linux
-    name = re.sub(r"[<>:\"/\\|?*\x00-\x1F]", "_", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name[:120] if len(name) > 120 else name
+    return sanitize_name(name, max_len=120, normalize_ascii=True)
 
 def iso_utc_compromises(d: dt.datetime) -> str:
     # preserva formato de Amp_images.py
@@ -623,9 +727,57 @@ class AmpClient:
         self.s = requests.Session()
         self.s.headers.update({"Accept": "application/json"})
 
-    def _get_raw(self, path: str, params: Dict[str, Any], timeout: int = 60) -> requests.Response:
+    def http_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+        timeout: Tuple[int, int] = (10, 60),
+        retries: int = 5,
+    ) -> requests.Response:
+        backoff = 1.0
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, retries + 1):
+            try:
+                r = self.s.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    params=params,
+                    json=json_body,
+                    auth=self.auth,
+                    timeout=timeout,
+                )
+            except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError) as e:
+                last_exc = e
+                if attempt == retries:
+                    raise
+                sleep_s = min(60.0, backoff)
+                _log("HTTP", "WARN", f"Retry red/transient. {_fmt_context(attempt=attempt, sleep=f'{sleep_s:.1f}s', url=url, error=e)}")
+                time.sleep(sleep_s)
+                backoff *= 2
+                continue
+
+            retryable_status = r.status_code == 429 or r.status_code >= 500
+            if retryable_status and attempt < retries:
+                retry_after = _parse_retry_after(r.headers.get("Retry-After"))
+                sleep_s = retry_after if retry_after is not None else min(60.0, backoff)
+                _log("HTTP", "WARN", f"Retry HTTP. {_fmt_context(attempt=attempt, status_code=r.status_code, sleep=f'{sleep_s:.1f}s', url=url)}")
+                time.sleep(max(0.0, sleep_s))
+                backoff *= 2
+                continue
+            return r
+
+        if last_exc:
+            raise last_exc
+        raise RuntimeError(f"Request failed without response: {method} {url}")
+
+    def _get_raw(self, path: str, params: Dict[str, Any], timeout: Tuple[int, int] = (10, 60)) -> requests.Response:
         url = f"{self.base_url}/{path.lstrip('/')}"
-        return self.s.get(url, params=params, auth=self.auth, timeout=timeout)
+        return self.http_request("GET", url, params=params, timeout=timeout)
 
     def get_groups(self) -> List[Dict[str, str]]:
         r = self._get_raw("groups", params={"limit": 500}, timeout=60)
@@ -1660,27 +1812,45 @@ def amp_main():
                 end_utc=end_utc,
                 debug_dir=None,
             )
-            compromise_events = filter_compromise_events(events_in_range)
+            compromise_events = filter_compromise_events(events_in_range or [])
 
             out_img_comp = os.path.join(out_dir, "compromises.png")
-            render_compromises_card(compromise_events, out_img_comp)
+            if not compromise_events:
+                render_empty_state("Compromises", f"{range_start}..{range_end}", out_img_comp, (C_CARD_W, C_CARD_H))
+            else:
+                render_compromises_card(compromise_events, out_img_comp)
+
+            ok, reason = check_image(out_img_comp, expected_size=(C_CARD_W, C_CARD_H))
+            if not ok:
+                err = RuntimeError(f"check_image compromises: {reason}")
+                _log("AMP", "ERROR", f"Imagen inválida. {_fmt_context(group=gname, output=out_img_comp, reason=reason)}")
+                _append_error(errors, gname, "compromises-image", err)
 
             _log("AMP", "OK", f"Compromises procesado. {_fmt_context(group=gname, date_range=f'{range_start}..{range_end}', count=len(compromise_events), output=out_img_comp)}")
         except Exception as e:
-            _log("AMP", "ERROR", f"Error en compromises. {_fmt_context(group=gname, date_range=f'{range_start}..{range_end}', output_dir=out_dir, error=e)}")
+            _log_exception("AMP", f"compromises group={gname}", e)
             _append_error(errors, gname, "compromises", e)
 
         # 2) THREATS -> threats.png
         try:
             events_thr = amp.get_events_last30_for_group_threats(gguid, start_utc, end_utc)
-            threats = build_unique_threats_by_detection_id(events_thr)
+            threats = build_unique_threats_by_detection_id(events_thr or [])
 
             out_img_thr = os.path.join(out_dir, "threats.png")
-            render_threats_card(threats, out_img_thr)
+            if not threats:
+                render_empty_state("Threats", f"{range_start}..{range_end}", out_img_thr, (T_CARD_W, T_CARD_H))
+            else:
+                render_threats_card(threats, out_img_thr)
+
+            ok, reason = check_image(out_img_thr, expected_size=(T_CARD_W, T_CARD_H))
+            if not ok:
+                err = RuntimeError(f"check_image threats: {reason}")
+                _log("AMP", "ERROR", f"Imagen inválida. {_fmt_context(group=gname, output=out_img_thr, reason=reason)}")
+                _append_error(errors, gname, "threats-image", err)
 
             _log("AMP", "OK", f"Threats procesado. {_fmt_context(group=gname, date_range=f'{range_start}..{range_end}', count=len(threats), output=out_img_thr)}")
         except Exception as e:
-            _log("AMP", "ERROR", f"Error en threats. {_fmt_context(group=gname, date_range=f'{range_start}..{range_end}', output_dir=out_dir, error=e)}")
+            _log_exception("AMP", f"threats group={gname}", e)
             _append_error(errors, gname, "threats", e)
 
         # 3) DEVICES -> devices.png
@@ -1697,17 +1867,28 @@ def amp_main():
                 sup, uns, baseline = compute_supported_unsupported_baseline(windows_eps)
 
                 out_img_dev = os.path.join(out_dir, "devices.png")
-                render_devices_card(
-                    top_os=top_os,
-                    supported=sup,
-                    unsupported=uns,
-                    outpath=out_img_dev,
-                    empty_note=(len(endpoints) == 0),
-                )
+                if len(endpoints) == 0:
+                    render_empty_state("Devices", f"{range_start}..{range_end}", out_img_dev, (D_CARD_W, D_CARD_H))
+                else:
+                    sup = max(0, int(sup or 0))
+                    uns = max(0, int(uns or 0))
+                    render_devices_card(
+                        top_os=top_os,
+                        supported=sup,
+                        unsupported=uns,
+                        outpath=out_img_dev,
+                        empty_note=False,
+                    )
+
+                ok, reason = check_image(out_img_dev, expected_size=(D_CARD_W, D_CARD_H))
+                if not ok:
+                    err = RuntimeError(f"check_image devices: {reason}")
+                    _log("AMP", "ERROR", f"Imagen inválida. {_fmt_context(group=gname, output=out_img_dev, reason=reason)}")
+                    _append_error(errors, gname, "devices-image", err)
 
                 _log("AMP", "OK", f"Devices procesado. {_fmt_context(group=gname, endpoints=len(endpoints), windows=len(windows_eps), supported=sup, unsupported=uns, output=out_img_dev)}")
         except Exception as e:
-            _log("AMP", "ERROR", f"Error en devices. {_fmt_context(group=gname, output_dir=out_dir, error=e)}")
+            _log_exception("AMP", f"devices group={gname}", e)
             _append_error(errors, gname, "devices", e)
 
         generated_here = 0
@@ -1740,7 +1921,7 @@ def run_tenable() -> Dict[str, Any]:
     try:
         data = tenable_main()
     except Exception as e:
-        _log("TENABLE", "ERROR", f"Error ejecutando Tenable: {e}")
+        _log_exception("TENABLE", "run_tenable", e)
         return {"rc": 1, "root_dirs": [], "groups_processed": 0, "images_generated": 0, "errors": [{"group": "Tenable", "endpoint": "run_tenable", "exception": f"{type(e).__name__}: {e}"}], "module_durations": {}, "group_durations": {}}
 
     rc = int(data.get("rc", 1))
@@ -1759,7 +1940,7 @@ def run_amp() -> Dict[str, Any]:
     try:
         data = amp_main()
     except Exception as e:
-        _log("AMP", "ERROR", f"Error ejecutando AMP: {e}")
+        _log_exception("AMP", "run_amp", e)
         return {"rc": 1, "root_dirs": [], "groups_processed": 0, "images_generated": 0, "errors": [{"group": "AMP", "endpoint": "run_amp", "exception": f"{type(e).__name__}: {e}"}], "group_durations": {}}
 
     _log("AMP", "OK", "Cisco AMP finalizado correctamente.")
@@ -1796,6 +1977,8 @@ def _log_summary(start_dt: datetime, end_dt: datetime, tenable_data: Dict[str, A
 
 def main() -> int:
     """Ejecuta Tenable y AMP en serie (siempre automático)."""
+    log_dir = _init_log_paths()
+    _log("ALL", "INFO", f"Logs habilitados en: {log_dir}")
     start_dt = datetime.now(timezone.utc)
     rc_tenable_data = run_tenable()
     rc_amp_data = run_amp()
@@ -1805,7 +1988,8 @@ def main() -> int:
 
     rc_tenable = int(rc_tenable_data.get("rc", 1))
     rc_amp = int(rc_amp_data.get("rc", 1))
-    rc_total = rc_tenable or rc_amp
+    all_errors = list(rc_tenable_data.get("errors", [])) + list(rc_amp_data.get("errors", []))
+    rc_total = rc_tenable or rc_amp or (1 if all_errors else 0)
     _log("ALL", "OK" if rc_total == 0 else "WARN", f"Proceso unificado finalizado. {_fmt_context(rc=rc_total)}")
     return int(rc_total)
 
