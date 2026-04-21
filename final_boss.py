@@ -457,6 +457,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 # ====================== AMP UNIFICADO (INLINE) ======================
 
+import importlib
+import subprocess
+
+
+def _ensure_dependencies() -> None:
+    required = {
+        "requests": "requests",
+        "PIL": "Pillow",
+        "pandas": "pandas",
+        "matplotlib": "matplotlib",
+        "docx": "python-docx",
+    }
+
+    missing = []
+    for module_name, package_name in required.items():
+        try:
+            importlib.import_module(module_name)
+        except ImportError:
+            missing.append(package_name)
+
+    if not missing:
+        return
+
+    print(f"[INFO] Instalando dependencias faltantes: {', '.join(missing)}")
+    cmd = [sys.executable, "-m", "pip", "install", *missing]
+    try:
+        subprocess.check_call(cmd)
+    except Exception:
+        subprocess.check_call([sys.executable, "-m", "ensurepip", "--upgrade"])
+        subprocess.check_call(cmd)
+
+
+_ensure_dependencies()
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
