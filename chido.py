@@ -255,8 +255,17 @@ def replace_docx_images(template_path: Path, output_path: Path, replacements: Di
             zout.writestr(item, data)
 
 
-def replace_text_in_docx(docx_path: Path, old_entity: str, new_entity: str, old_period: Optional[str], new_period: Optional[str]) -> None:
-    from docx import Document
+def replace_text_in_docx(
+    docx_path: Path,
+    old_entity: str,
+    new_entity: str,
+    old_period: Optional[str],
+    new_period: Optional[str],
+) -> None:
+    try:
+        from docx import Document  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("python-docx no está disponible para reemplazar texto.") from exc
 
     def repl(text: str) -> str:
         if not text:
@@ -267,15 +276,33 @@ def replace_text_in_docx(docx_path: Path, old_entity: str, new_entity: str, old_
         return text
 
     doc = Document(str(docx_path))
-    for p in doc.paragraphs:
-        for run in p.runs:
-            run.text = repl(run.text)
+
+    def process_paragraphs(paragraphs):
+        for p in paragraphs:
+            for run in p.runs:
+                run.text = repl(run.text)
+
+    process_paragraphs(doc.paragraphs)
+
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
-                for p in cell.paragraphs:
-                    for run in p.runs:
-                        run.text = repl(run.text)
+                process_paragraphs(cell.paragraphs)
+
+    for section in doc.sections:
+        process_paragraphs(section.header.paragraphs)
+        process_paragraphs(section.footer.paragraphs)
+
+        for table in section.header.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    process_paragraphs(cell.paragraphs)
+
+        for table in section.footer.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    process_paragraphs(cell.paragraphs)
+
     doc.save(str(docx_path))
 
 
@@ -1872,21 +1899,17 @@ def _tenable_allowed_targets_override() -> Optional[set[tuple[str, str]]]:
 def _filter_tag_pairs_by_allowed(tags: List[tuple[str, str]], allowed: Optional[set[tuple[str, str]]]) -> List[tuple[str, str]]:
     if allowed is None:
         return tags
-    return [(cat, val) for (cat, val) in tags if (norm(cat), norm(val)) in allowed]
+    filtered = [(cat, val) for (cat, val) in tags if (norm(cat), norm(val)) in allowed]
+    if filtered:
+        return filtered
+    print("[WARN] Filtro Tenable sin coincidencias en tags descubiertos; se usarán todos los tags para no romper materialización.")
+    return tags
 
 
 def _is_tag_allowed(cat: str, val: str, allowed: Optional[set[tuple[str, str]]]) -> bool:
     if allowed is None:
         return True
     return (norm(cat), norm(val)) in allowed
-
-
-def _filter_existing_amp_groups(groups: List[Dict[str, Any]], allowed_amp: Optional[set[str]]) -> List[Dict[str, Any]]:
-    if allowed_amp is None:
-        return groups
-    existing = {norm(g.get("name", "")) for g in groups}
-    valid_allowed = allowed_amp & existing
-    return [g for g in groups if norm(g.get("name", "")) in valid_allowed]
 
 
 def _run_controlesCIS_from_cached_export(ns, dataset_path: str, base_out: str,
@@ -1995,14 +2018,16 @@ def _run_tenable_images_per_tag(base_out: str, allowed_tenable: Optional[set[tup
     print(f"[INFO] (vm-vulns) Descubriendo tags en categorías: {', '.join(ns.get('WANTED_CATEGORIES', []))} ...")
     targets = discover_targets(sess)
     discovered_count = len(targets)
-    targets = [
+    filtered_targets = [
         t for t in targets
         if _is_tag_allowed(t.get("tag_category", ""), t.get("tag_value", ""), allowed_tenable)
     ]
     if allowed_tenable is not None:
-        print(f"[INFO] (vm-vulns) Tags existentes={discovered_count} | permitidos+existentes={len(targets)}")
-    if allowed_tenable is not None and not targets:
-        print("[INFO] (vm-vulns) Sin tags permitidos tras aplicar filtro; no se generarán imágenes por tag.")
+        if filtered_targets:
+            targets = filtered_targets
+        else:
+            print("[WARN] (vm-vulns) Filtro Tenable sin coincidencias; se procesarán todos los tags descubiertos para no perder 03/04/05.")
+        print(f"[INFO] (vm-vulns) Tags existentes={discovered_count} | a procesar={len(targets)}")
     print(f"[INFO] (vm-vulns) Tags descubiertas: {len(targets)}")
 
     # Guardar targets descubiertos
@@ -2083,10 +2108,9 @@ def run_all() -> int:
             discovered_tags = ns["list_tag_values"](_s)
             cached_tags = _filter_tag_pairs_by_allowed(discovered_tags, allowed_tenable)
             if allowed_tenable is not None:
-                print(f"[INFO] (cis-controls) Tags existentes={len(discovered_tags)} | permitidos+existentes={len(cached_tags)}")
-            if allowed_tenable is not None and not cached_tags:
-                print("[INFO] (cis-controls) Sin tags permitidos tras aplicar filtro; módulo continuará sin tags para salida por tag.")
-            ns["list_tag_values"] = (lambda _session, _t=cached_tags: _t)
+                print(f"[INFO] (cis-controls) Tags existentes={len(discovered_tags)} | a procesar={len(cached_tags)}")
+            if cached_tags:
+                ns["list_tag_values"] = (lambda _session, _t=cached_tags: _t)
         except Exception:
             cached_tags = None
 
@@ -2110,7 +2134,7 @@ def run_all() -> int:
         ns = _load_embedded_module("controlesCIS")
 
         # Reutiliza el listado de tags ya consultado en cis-controls (evita otra llamada a /tags/values)
-        if cached_tags is not None:
+        if cached_tags:
             ns["discover_all_tags"] = (lambda _session, _t=cached_tags: _t)
 
         dataset_path = os.path.join(base_out, "compliance_export_all.jsonl.gz")
