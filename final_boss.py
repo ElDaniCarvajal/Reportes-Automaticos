@@ -423,13 +423,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         print(f"[INFO] Temporales en: {tmp_path}")
         print("[INFO] Generando imágenes de AMP...")
-        amp_root = run_amp_unified(amp_workdir, start_utc, end_utc)
+        amp_root: Optional[Path] = None
+        try:
+            amp_root = run_amp_unified(amp_workdir, start_utc, end_utc)
+        except Exception as e:
+            print(f"[WARN] No se pudieron generar imágenes de AMP ({e}). Se continuará con imágenes AMP originales del template.")
 
         print("[INFO] Generando imágenes de Tenable...")
         tenable_root = tenable_workdir / "tenable_reportes_unificados"
         tenable_root = run_tenable_unified(tenable_workdir, tenable_root)
 
-        amp_dirs = list_amp_group_dirs(amp_root)
+        amp_dirs = list_amp_group_dirs(amp_root) if amp_root else {}
         tenable_dirs = list_tenable_tag_dirs(tenable_root)
         print(f"[INFO] Carpetas AMP detectadas: {len(amp_dirs)}")
         print(f"[INFO] Carpetas Tenable detectadas: {len(tenable_dirs)}")
