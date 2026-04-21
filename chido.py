@@ -2184,6 +2184,109 @@ def _is_tag_allowed(cat: str, val: str, allowed: Optional[set[tuple[str, str]]])
     return (norm(cat), norm(val)) in allowed
 
 
+def _looks_like_network_discovery_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    if any(token in msg for token in (
+        "failed to resolve",
+        "nameresolutionerror",
+        "temporary failure in name resolution",
+        "nodename nor servname provided",
+        "connection error",
+        "connection aborted",
+        "connection reset",
+        "max retries exceeded",
+        "timed out",
+        "timeout",
+        "dns",
+    )):
+        return True
+    try:
+        import requests as _requests
+        if isinstance(exc, (_requests.exceptions.ConnectionError, _requests.exceptions.Timeout)):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _load_cached_vm_targets(base_out: str) -> List[Dict[str, str]]:
+    path = os.path.join(base_out, "targets_discovered.json")
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return []
+        out: List[Dict[str, str]] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            cat = str(item.get("tag_category", "")).strip()
+            val = str(item.get("tag_value", "")).strip()
+            tid = str(item.get("id", "")).strip()
+            if not cat or not val:
+                continue
+            out.append({
+                "id": tid or f"{norm(cat).replace(' ', '_').upper()}_{norm(val).replace(' ', '_').upper()}",
+                "tag_category": cat,
+                "tag_value": val,
+                "tag_value_uuid": str(item.get("tag_value_uuid", "") or ""),
+            })
+        return out
+    except Exception:
+        return []
+
+
+def build_vm_targets_from_allowed(ns: Dict[str, Any], allowed_tenable: Optional[set[tuple[str, str]]]) -> List[Dict[str, str]]:
+    slug_fn = ns.get("slug")
+    if not callable(slug_fn):
+        slug_fn = lambda s: re.sub(r"[^a-z0-9]+", "_", norm(s)).strip("_").upper() or "NA"
+
+    # Prioridad interna del fallback local:
+    # 1) override explícito (ya viene en allowed_tenable desde TENABLE_ALLOWED_TARGETS_OVERRIDE)
+    # 2) TARGETS del proyecto
+    pairs: List[tuple[str, str]] = []
+    if allowed_tenable:
+        pairs = sorted({(str(c), str(v)) for (c, v) in allowed_tenable}, key=lambda x: (norm(x[0]), norm(x[1])))
+    else:
+        pairs = sorted({(t.tenable_category, t.tenable_value) for t in TARGETS}, key=lambda x: (norm(x[0]), norm(x[1])))
+
+    out: List[Dict[str, str]] = []
+    seen = set()
+    for cat, val in pairs:
+        key = (norm(cat), norm(val))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "id": f"{slug_fn(cat)}_{slug_fn(val)}",
+            "tag_category": cat,
+            "tag_value": val,
+            "tag_value_uuid": "",
+        })
+    return out
+
+
+def _discover_vm_targets_with_retry(sess, discover_targets_fn, retries: int = 3, base_sleep: float = 1.25) -> List[Dict[str, str]]:
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            print("[INFO] (vm-vulns) intentando discover_targets remoto...")
+            return discover_targets_fn(sess)
+        except Exception as e:
+            last_exc = e
+            is_net = _looks_like_network_discovery_error(e)
+            if attempt >= retries or not is_net:
+                break
+            sleep_s = base_sleep * attempt
+            print(f"[WARN] (vm-vulns) discover_targets intento {attempt}/{retries} falló ({e}); reintentando en {sleep_s:.1f}s...")
+            time.sleep(sleep_s)
+    if last_exc is not None:
+        raise last_exc
+    return []
+
+
 def _run_controlesCIS_from_cached_export(ns, dataset_path: str, base_out: str,
                                         rows_to_show: int = 12, assets_per_row: int = 3,
                                         allowed_tenable: Optional[set[tuple[str, str]]] = None) -> int:
@@ -2288,19 +2391,62 @@ def _run_tenable_images_per_tag(base_out: str, allowed_tenable: Optional[set[tup
 
     sess = make_session()
     print(f"[INFO] (vm-vulns) Descubriendo tags en categorías: {', '.join(ns.get('WANTED_CATEGORIES', []))} ...")
-    targets = discover_targets(sess)
-    discovered_count = len(targets)
-    filtered_targets = [
-        t for t in targets
-        if _is_tag_allowed(t.get("tag_category", ""), t.get("tag_value", ""), allowed_tenable)
-    ]
-    if allowed_tenable is not None:
-        if filtered_targets:
-            targets = filtered_targets
+    used_fallback = False
+    targets: List[Dict[str, str]] = []
+    discovered_count = 0
+    try:
+        targets = _discover_vm_targets_with_retry(sess, discover_targets, retries=3, base_sleep=1.0)
+        discovered_count = len(targets)
+    except Exception as e:
+        if _looks_like_network_discovery_error(e):
+            print(f"[WARN] (vm-vulns) discover_targets falló por red/DNS, usando fallback local: {e}")
+            used_fallback = True
         else:
-            print("[WARN] (vm-vulns) Filtro Tenable sin coincidencias; se procesarán todos los tags descubiertos para no perder 03/04/05.")
+            print(f"[WARN] (vm-vulns) discover_targets falló ({e}), usando fallback local si existe.")
+            used_fallback = True
+
+    if targets:
+        filtered_targets = [
+            t for t in targets
+            if _is_tag_allowed(t.get("tag_category", ""), t.get("tag_value", ""), allowed_tenable)
+        ]
+        if allowed_tenable is not None:
+            if filtered_targets:
+                targets = filtered_targets
+            else:
+                print("[WARN] (vm-vulns) Filtro Tenable sin coincidencias; se usará fallback local para no perder 03/04/05.")
+                targets = []
+
+    if not targets:
+        fallback_targets = build_vm_targets_from_allowed(ns, allowed_tenable)
+        cached_targets = _load_cached_vm_targets(base_out)
+        if cached_targets:
+            if allowed_tenable is not None:
+                cached_targets = [
+                    t for t in cached_targets
+                    if _is_tag_allowed(t.get("tag_category", ""), t.get("tag_value", ""), allowed_tenable)
+                ]
+            cache_index = {(norm(t.get("tag_category", "")), norm(t.get("tag_value", ""))): t for t in cached_targets}
+            merged: List[Dict[str, str]] = []
+            for fb in fallback_targets:
+                k = (norm(fb.get("tag_category", "")), norm(fb.get("tag_value", "")))
+                merged.append(cache_index.get(k, fb))
+            for k, ct in cache_index.items():
+                if k not in {(norm(x.get("tag_category", "")), norm(x.get("tag_value", ""))) for x in merged}:
+                    merged.append(ct)
+            fallback_targets = merged
+        targets = fallback_targets
+        used_fallback = True
+
+    if used_fallback:
+        print(f"[INFO] (vm-vulns) targets por fallback: {len(targets)}")
+    else:
         print(f"[INFO] (vm-vulns) Tags existentes={discovered_count} | a procesar={len(targets)}")
     print(f"[INFO] (vm-vulns) Tags descubiertas: {len(targets)}")
+
+    if not targets:
+        print("[ERR] (vm-vulns) No hay targets disponibles: falló discovery y no existe fallback local/override/TARGETS.")
+        return 2
 
     # Guardar targets descubiertos
     try:
@@ -2312,6 +2458,9 @@ def _run_tenable_images_per_tag(base_out: str, allowed_tenable: Optional[set[tup
 
     sleep_s = ns.get("SLEEP_BETWEEN_EXPORTS_SECONDS", 0) or 0
 
+    ok_generated = 0
+    no_data = 0
+    failed = 0
     for i, t in enumerate(targets, start=1):
         cat = t.get("tag_category", "")
         val = t.get("tag_value", "")
@@ -2333,6 +2482,7 @@ def _run_tenable_images_per_tag(base_out: str, allowed_tenable: Optional[set[tup
 
             if res.get("spotlight"):
                 render_spotlight(tag_label, res["spotlight"], sp_img)
+                ok_generated += 1
                 print(f"  [OK] total={res['total_vulns']} -> 03/04/05")
             else:
                 # Si no hay spotlight, no creamos el archivo
@@ -2341,14 +2491,20 @@ def _run_tenable_images_per_tag(base_out: str, allowed_tenable: Optional[set[tup
                         os.remove(sp_img)
                     except Exception:
                         pass
+                no_data += 1
                 print(f"  [OK] total={res['total_vulns']} -> 03/04 (spotlight: none)")
+            print(f"  [INFO] (vm-vulns) 03 -> {sev_img}")
+            print(f"  [INFO] (vm-vulns) 04 -> {top_img}")
+            print(f"  [INFO] (vm-vulns) 05 -> {sp_img}")
 
         except Exception as e:
+            failed += 1
             print(f"  [ERR] {e}")
 
         if sleep_s and sleep_s > 0:
             time.sleep(float(sleep_s))
 
+    print(f"[INFO] (vm-vulns) Resumen: generados={ok_generated} | sin_data={no_data} | fallidos={failed}")
     print(f"[DONE] (vm-vulns) Imágenes en: {base_out}")
     return 0
 
