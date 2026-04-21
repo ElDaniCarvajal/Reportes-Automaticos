@@ -11,6 +11,7 @@ import sys
 import tempfile
 import zipfile
 import unicodedata
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -349,55 +350,79 @@ def replace_docx_images(template_path: Path, output_path: Path, replacements: Di
     return missing_slots
 
 
-def replace_text_in_docx(
+def replace_text_in_docx_xml(
     docx_path: Path,
     old_entity: str,
     new_entity: str,
     old_period: Optional[str],
     new_period: Optional[str],
-) -> None:
-    try:
-        from docx import Document  # type: ignore
-    except Exception as exc:
-        raise RuntimeError("python-docx no está disponible para reemplazar texto.") from exc
+) -> dict[str, int]:
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
-    def repl(text: str) -> str:
+    def repl(text: str) -> tuple[str, bool, bool]:
         if not text:
-            return text
-        text = text.replace(old_entity, new_entity)
-        if old_period and new_period:
-            text = text.replace(old_period, new_period)
-        return text
+            return text, False, False
+        changed_entity = old_entity in text
+        updated = text.replace(old_entity, new_entity)
+        changed_period = False
+        if old_period and new_period and old_period in updated:
+            changed_period = True
+            updated = updated.replace(old_period, new_period)
+        return updated, changed_entity, changed_period
 
-    doc = Document(str(docx_path))
+    xml_targets: List[str] = []
+    with zipfile.ZipFile(docx_path, "r") as zin:
+        for name in zin.namelist():
+            if name == "word/document.xml":
+                xml_targets.append(name)
+            elif re.fullmatch(r"word/header\d+\.xml", name):
+                xml_targets.append(name)
+            elif re.fullmatch(r"word/footer\d+\.xml", name):
+                xml_targets.append(name)
 
-    def process_paragraphs(paragraphs):
-        for p in paragraphs:
-            for run in p.runs:
-                run.text = repl(run.text)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+            tmp_docx = Path(tmp.name)
 
-    process_paragraphs(doc.paragraphs)
+        changed_xml_files = 0
+        changed_paragraphs = 0
+        entity_replacements = 0
+        period_replacements = 0
 
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                process_paragraphs(cell.paragraphs)
+        with zipfile.ZipFile(tmp_docx, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename in xml_targets:
+                    root = ET.fromstring(data)
+                    file_changed = False
+                    for para in root.findall(".//w:p", ns):
+                        text_nodes = para.findall(".//w:t", ns)
+                        if not text_nodes:
+                            continue
+                        full_text = "".join(node.text or "" for node in text_nodes)
+                        new_text, did_entity, did_period = repl(full_text)
+                        if new_text != full_text:
+                            text_nodes[0].text = new_text
+                            for node in text_nodes[1:]:
+                                node.text = ""
+                            file_changed = True
+                            changed_paragraphs += 1
+                            if did_entity:
+                                entity_replacements += 1
+                            if did_period:
+                                period_replacements += 1
+                    if file_changed:
+                        changed_xml_files += 1
+                        data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+                zout.writestr(item, data)
 
-    for section in doc.sections:
-        process_paragraphs(section.header.paragraphs)
-        process_paragraphs(section.footer.paragraphs)
-
-        for table in section.header.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    process_paragraphs(cell.paragraphs)
-
-        for table in section.footer.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    process_paragraphs(cell.paragraphs)
-
-    doc.save(str(docx_path))
+    tmp_docx.replace(docx_path)
+    return {
+        "xml_targets": len(xml_targets),
+        "changed_xml_files": changed_xml_files,
+        "changed_paragraphs": changed_paragraphs,
+        "entity_replacements": entity_replacements,
+        "period_replacements": period_replacements,
+    }
 
 
 def build_report_for_target(target: Target, template_path: Path, output_dir: Path, amp_dirs: Dict[str, Path], tenable_dirs: Dict[Tuple[str, str], Path]) -> Tuple[Optional[Path], List[str]]:
@@ -414,13 +439,26 @@ def build_report_for_target(target: Target, template_path: Path, output_dir: Pat
     for slot in missing_slots:
         warnings.append(f"{target.display_name}: el template no contiene el slot '{slot}'. Revisa DOCX_IMAGE_MAP contra la plantilla actual.")
     if REPLACE_TEXT_INSIDE_DOCX:
-        replace_text_in_docx(
+        text_stats = replace_text_in_docx_xml(
             out_file,
             TEMPLATE_ENTITY_NAME,
             cover_entity_name(target),
             TEMPLATE_PERIOD_TEXT,
             REPORT_PERIOD_DOCX or None,
         )
+        print(
+            "[DEBUG][DOCX] Reemplazo XML "
+            f"(target={target.display_name}) -> xml_objetivo={text_stats['xml_targets']}, "
+            f"xml_modificados={text_stats['changed_xml_files']}, "
+            f"parrafos_modificados={text_stats['changed_paragraphs']}, "
+            f"entidad_reemplazos={text_stats['entity_replacements']}, "
+            f"fecha_reemplazos={text_stats['period_replacements']}"
+        )
+        if text_stats["entity_replacements"] > 0:
+            print(f"[DEBUG][DOCX] Entidad reemplazada correctamente para '{target.display_name}'.")
+        if text_stats["period_replacements"] > 0:
+            print(f"[DEBUG][DOCX] Fecha reemplazada correctamente para '{target.display_name}': '{REPORT_PERIOD_DOCX}'.")
+        print("[DEBUG][DOCX] Confirmación: NO se usó python-docx para guardar el archivo final.")
     return out_file, warnings
 
 
@@ -566,6 +604,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     require_exists(template_docx, "TEMPLATE_DOCX")
     template_media = inspect_template_media(template_docx)
     print(f"[DEBUG][DOCX] Template: {template_docx}")
+    print(f"[DEBUG][DOCX] REPORT_PERIOD_DOCX: {REPORT_PERIOD_DOCX}")
     print(f"[DEBUG][DOCX] Total media encontrados: {len(template_media)}")
     missing_expected_slots = [slot for slot in DOCX_IMAGE_MAP if slot not in template_media]
     if missing_expected_slots:
@@ -636,7 +675,6 @@ def _ensure_dependencies() -> None:
         "PIL": "Pillow",
         "pandas": "pandas",
         "matplotlib": "matplotlib",
-        "docx": "python-docx",
     }
 
     missing = []
