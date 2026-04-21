@@ -10,6 +10,7 @@ import re
 import sys
 import tempfile
 import zipfile
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -125,6 +126,7 @@ def run_amp_unified(workdir: Path, start_utc: datetime, end_utc: datetime, allow
         AMP_END_UTC_OVERRIDE = end_utc
         AMP_ALLOWED_GROUPS_OVERRIDE = set(allowed_amp) if allowed_amp is not None else None
         OUTPUT_ROOT = os.path.join(os.getcwd(), "amp_reportes_unificado")
+        print(f"[DEBUG][AMP] OUTPUT_ROOT configurado en: {OUTPUT_ROOT}")
         amp_main()
     finally:
         AMP_START_UTC_OVERRIDE = None
@@ -133,6 +135,7 @@ def run_amp_unified(workdir: Path, start_utc: datetime, end_utc: datetime, allow
         os.chdir(old_cwd)
     amp_root = workdir / "amp_reportes_unificado"
     require_exists(amp_root, "salida AMP")
+    print(f"[DEBUG][AMP] Carpeta raíz AMP generada: {amp_root}")
     return amp_root
 
 
@@ -174,9 +177,14 @@ def list_amp_group_dirs(amp_root: Path) -> Dict[str, Path]:
     if not amp_root.is_dir():
         return out
     real_root = find_latest_timestamp_dir(amp_root)
+    print(f"[DEBUG][AMP] Directorio AMP inspeccionado: {real_root}")
     for child in real_root.iterdir():
         if child.is_dir():
             out[norm(child.name)] = child
+    if out:
+        print("[DEBUG][AMP] Grupos AMP detectados:")
+        for k in sorted(out):
+            print(f"  - {k} -> {out[k]}")
     return out
 
 
@@ -213,7 +221,15 @@ def list_tenable_tag_dirs(tenable_root: Path) -> Dict[Tuple[str, str], Path]:
 
 
 def resolve_amp_dir(target: Target, amp_dirs: Dict[str, Path]) -> Optional[Path]:
-    return amp_dirs.get(norm(target.amp_name))
+    wanted = norm(target.amp_name)
+    exact = amp_dirs.get(wanted)
+    if exact:
+        return exact
+    for k, v in amp_dirs.items():
+        if wanted in k or k in wanted:
+            print(f"[WARN][AMP] Match no exacto para '{target.amp_name}': usando grupo '{k}' -> {v}")
+            return v
+    return None
 
 
 def resolve_tenable_dir(target: Target, tenable_dirs: Dict[Tuple[str, str], Path]) -> Optional[Path]:
@@ -246,13 +262,28 @@ def collect_images_for_target(target: Target, amp_dir: Optional[Path], tenable_d
     return replacements, warnings
 
 
-def replace_docx_images(template_path: Path, output_path: Path, replacements: Dict[str, bytes]) -> None:
+def inspect_template_media(template_path: Path) -> set[str]:
+    media: set[str] = set()
+    with zipfile.ZipFile(template_path, "r") as zin:
+        for name in zin.namelist():
+            if name.startswith("word/media/"):
+                media.add(name)
+    return media
+
+
+def replace_docx_images(template_path: Path, output_path: Path, replacements: Dict[str, bytes]) -> List[str]:
+    missing_slots: List[str] = []
+    template_files = inspect_template_media(template_path)
+    for slot in replacements:
+        if slot not in template_files:
+            missing_slots.append(slot)
     with zipfile.ZipFile(template_path, "r") as zin, zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
         for item in zin.infolist():
             data = zin.read(item.filename)
             if item.filename in replacements:
                 data = replacements[item.filename]
             zout.writestr(item, data)
+    return missing_slots
 
 
 def replace_text_in_docx(
@@ -309,10 +340,16 @@ def replace_text_in_docx(
 def build_report_for_target(target: Target, template_path: Path, output_dir: Path, amp_dirs: Dict[str, Path], tenable_dirs: Dict[Tuple[str, str], Path]) -> Tuple[Optional[Path], List[str]]:
     amp_dir = resolve_amp_dir(target, amp_dirs)
     tenable_dir = resolve_tenable_dir(target, tenable_dirs)
+    if amp_dir:
+        for fname in ("compromises.png", "threats.png", "devices.png"):
+            fpath = amp_dir / fname
+            print(f"[DEBUG][AMP] {target.display_name} -> {fpath} {'[OK]' if fpath.is_file() else '[MISSING]'}")
     replacements, warnings = collect_images_for_target(target, amp_dir, tenable_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     out_file = output_dir / output_filename_for(target)
-    replace_docx_images(template_path, out_file, replacements)
+    missing_slots = replace_docx_images(template_path, out_file, replacements)
+    for slot in missing_slots:
+        warnings.append(f"{target.display_name}: el template no contiene el slot '{slot}'. Revisa DOCX_IMAGE_MAP contra la plantilla actual.")
     if REPLACE_TEXT_INSIDE_DOCX:
         replace_text_in_docx(out_file, TEMPLATE_ENTITY_NAME, target.display_name, TEMPLATE_PERIOD_TEXT, REPORT_PERIOD or None)
     return out_file, warnings
@@ -456,6 +493,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         start_utc, end_utc, REPORT_PERIOD, month_folder = choose_period_interactive()
 
     require_exists(template_docx, "TEMPLATE_DOCX")
+    template_media = inspect_template_media(template_docx)
+    print(f"[DEBUG][DOCX] Template: {template_docx}")
+    print(f"[DEBUG][DOCX] Total media encontrados: {len(template_media)}")
+    missing_expected_slots = [slot for slot in DOCX_IMAGE_MAP if slot not in template_media]
+    if missing_expected_slots:
+        print("[WARN][DOCX] Slots esperados no encontrados en el template actual:")
+        for slot in missing_expected_slots:
+            print(f"  - {slot} (mapeado a {DOCX_IMAGE_MAP[slot]})")
+        print("[WARN][DOCX] Si el DOCX cambió internamente, ajusta DOCX_IMAGE_MAP a los nuevos imageX.png.")
+
     OUTPUT_DIR = BASE_OUTPUT_DIR / month_folder
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -481,6 +528,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         amp_dirs = list_amp_group_dirs(amp_root) if amp_root else {}
         tenable_dirs = list_tenable_tag_dirs(tenable_root)
         print(f"[INFO] Carpetas AMP detectadas: {len(amp_dirs)}")
+        if amp_dirs:
+            print(f"[DEBUG][AMP] Nombres de grupos AMP detectados (normalizados): {sorted(amp_dirs.keys())}")
         print(f"[INFO] Carpetas Tenable detectadas: {len(tenable_dirs)}")
 
         generated = 0
@@ -611,6 +660,30 @@ def sanitize_folder(name: str) -> str:
     name = re.sub(r"[<>:\"/\\|?*\x00-\x1F]", "_", name)
     name = re.sub(r"\s+", " ", name).strip()
     return name[:120] if len(name) > 120 else name
+
+def _amp_norm_name(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+def _filter_existing_amp_groups(groups: List[Dict[str, str]], allowed_amp: set[str]) -> List[Dict[str, str]]:
+    if not allowed_amp:
+        return groups
+    allowed_norm = {_amp_norm_name(x) for x in allowed_amp if x}
+    selected: List[Dict[str, str]] = []
+    skipped: List[str] = []
+    for g in groups:
+        gname = str(g.get("name") or "")
+        gnorm = _amp_norm_name(gname)
+        if gnorm in allowed_norm or any(gnorm in a or a in gnorm for a in allowed_norm):
+            selected.append(g)
+        else:
+            skipped.append(gname)
+    print(f"[DEBUG][AMP] Grupos filtrados ({len(selected)}): {[g.get('name') for g in selected]}")
+    if skipped:
+        print(f"[DEBUG][AMP] Grupos omitidos por filtro ({len(skipped)}): {skipped[:20]}{'...' if len(skipped) > 20 else ''}")
+    return selected
 
 def iso_utc_compromises(d: dt.datetime) -> str:
     # preserva formato de Amp_images.py
@@ -2081,6 +2154,105 @@ def _run_tenable_images_per_tag(base_out: str, allowed_tenable: Optional[set[tup
     return 0
 
 
+def _identity_counts_from_tenable_one(ns: Dict[str, Any], labels: List[str]) -> Dict[str, Optional[int]]:
+    counts: Dict[str, Optional[int]] = {}
+    t1_queries = ns.get("T1_QUERIES", {})
+    t1_count = ns.get("t1_assets_count")
+    if not callable(t1_count):
+        raise RuntimeError("Módulo identity no expone t1_assets_count().")
+    for label in labels:
+        query = t1_queries.get(label)
+        print(f"[DEBUG][IDENTITY] KPI='{label}' | modo=Tenable One | query={query}")
+        total = int(t1_count(query))
+        counts[label] = total
+        print(f"[DEBUG][IDENTITY] KPI='{label}' | total={total}")
+    return counts
+
+
+def _identity_counts_from_ie(ns: Dict[str, Any], labels: List[str]) -> Dict[str, Optional[int]]:
+    counts: Dict[str, Optional[int]] = {}
+    get_profiles = ns.get("get_profiles")
+    get_checkers = ns.get("get_checkers")
+    count_checker = ns.get("count_deviances_for_checker")
+    if not (callable(get_profiles) and callable(get_checkers) and callable(count_checker)):
+        raise RuntimeError("Módulo identity no expone funciones IE necesarias.")
+
+    profiles = get_profiles()
+    if not profiles:
+        raise RuntimeError("Identity Exposure no devolvió profiles.")
+    profile_id = str(profiles[0].get("id"))
+    print(f"[DEBUG][IDENTITY] Modo=Identity Exposure | profile_id={profile_id}")
+
+    wanted = {
+        "Dormant Account": "C-SLEEPING-ACCOUNTS",
+        "Domain Admin": "C-ADMINCOUNT-ACCOUNT-PROPS",
+        "Guest Account": "C-GUEST-ACCOUNT",
+    }
+    checkers = get_checkers(profile_id)
+    codename_to_id = {c.get("codename"): c.get("id") for c in checkers if c.get("codename") and c.get("id")}
+    for label in labels:
+        codename = wanted.get(label)
+        cid = codename_to_id.get(codename)
+        print(f"[DEBUG][IDENTITY] KPI='{label}' | modo=Identity Exposure | checker={codename} | checker_id={cid}")
+        if not cid:
+            counts[label] = None
+            continue
+        total = int(count_checker(profile_id, cid))
+        counts[label] = total
+        print(f"[DEBUG][IDENTITY] KPI='{label}' | total={total}")
+    return counts
+
+
+def _run_identity_with_debug(ns: Dict[str, Any]) -> int:
+    labels = list(ns.get("KPI_LABELS", ["Dormant Account", "Domain Admin", "Guest Account"]))
+    make_image = ns.get("make_image")
+    if not callable(make_image):
+        raise RuntimeError("Módulo identity no expone make_image().")
+
+    mode = os.getenv("IDENTITY_MODE", "auto").strip().lower()
+    has_t1 = bool(ns.get("TENABLE_ACCESS_KEY") and ns.get("TENABLE_SECRET_KEY"))
+    has_ie = bool(ns.get("IE_API_KEY"))
+    print(f"[INFO][IDENTITY] mode={mode} | has_tenable_one_keys={has_t1} | has_ie_api_key={has_ie}")
+
+    counts: Dict[str, Optional[int]]
+    if mode == "ie":
+        if not has_ie:
+            raise RuntimeError("IDENTITY_MODE=ie pero no existe IE_API_KEY.")
+        counts = _identity_counts_from_ie(ns, labels)
+    elif mode == "t1":
+        if not has_t1:
+            raise RuntimeError("IDENTITY_MODE=t1 pero faltan llaves TENABLE_ACCESS_KEY/TENABLE_SECRET_KEY.")
+        counts = _identity_counts_from_tenable_one(ns, labels)
+    else:
+        if has_t1:
+            counts = _identity_counts_from_tenable_one(ns, labels)
+            dormant = counts.get("Dormant Account")
+            if dormant == 0:
+                print("[WARN][IDENTITY] Dormant Account=0 en Tenable One.")
+                if has_ie:
+                    print("[WARN][IDENTITY] Reintentando con Identity Exposure para validar fallback.")
+                    ie_counts = _identity_counts_from_ie(ns, labels)
+                    ie_dormant = ie_counts.get("Dormant Account")
+                    if ie_dormant not in (None, 0):
+                        print(f"[WARN][IDENTITY] Se usará Identity Exposure por mejor señal (Dormant={ie_dormant}).")
+                        counts = ie_counts
+                    else:
+                        print("[WARN][IDENTITY] IE también devolvió Dormant 0/vacío.")
+                else:
+                    print("[WARN][IDENTITY] Sin IE_API_KEY para fallback; se conserva el 0 de Tenable One.")
+        elif has_ie:
+            counts = _identity_counts_from_ie(ns, labels)
+        else:
+            raise RuntimeError("Sin llaves para Tenable One ni IE_API_KEY para Identity Exposure.")
+
+    if counts.get("Dormant Account") == 0:
+        print("[WARN][IDENTITY] Dormant Account quedó en 0; revisar query/endpoint/parsing en tenant.")
+    make_image(counts)
+    print(f"[INFO][IDENTITY] Counts finales: {counts}")
+    print(f"[INFO][IDENTITY] Imagen generada: {ns.get('OUT_FILE')}")
+    return 0
+
+
 def run_all() -> int:
     base_out = _unified_out_dir()
     allowed_tenable = _tenable_allowed_targets_override()
@@ -2180,7 +2352,7 @@ def run_all() -> int:
         # Unifica salida
         ns["OUT_FILE"] = identity_path
 
-        rc = _run_module(ns, [])
+        rc = _run_identity_with_debug(ns)
         if rc != 0:
             rc_total = rc_total or rc
             print(f"[WARN] identity terminó con código {rc}")
