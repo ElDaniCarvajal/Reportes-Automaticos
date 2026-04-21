@@ -315,21 +315,19 @@ def fit_image_to_placeholder(source_bytes: bytes, placeholder_bytes: bytes) -> b
     if target_w <= 0 or target_h <= 0:
         return source_bytes
 
-    # Estrategia "cover": llenamos el placeholder completo para evitar
-    # imagen pequeña centrada sobre canvas blanco.
-    ratio = max(target_w / src.width, target_h / src.height)
+    # Estrategia "contain": no recortar ni deformar.
+    ratio = min(target_w / src.width, target_h / src.height)
     new_w = max(1, int(round(src.width * ratio)))
     new_h = max(1, int(round(src.height * ratio)))
     resized = src.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-    left = max(0, (new_w - target_w) // 2)
-    top = max(0, (new_h - target_h) // 2)
-    right = left + target_w
-    bottom = top + target_h
-    fitted = resized.crop((left, top, right, bottom))
+    canvas = Image.new("RGB", (target_w, target_h), "white")
+    left = (target_w - new_w) // 2
+    top = (target_h - new_h) // 2
+    canvas.paste(resized, (left, top))
 
     out = BytesIO()
-    fitted.save(out, format="PNG", optimize=True)
+    canvas.save(out, format="PNG", optimize=True)
     return out.getvalue()
 
 
