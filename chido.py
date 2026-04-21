@@ -21,6 +21,9 @@ REPORT_PERIOD = ""
 CURRENT_MONTH_FOLDER = datetime.now().strftime("%Y-%m")
 OUTPUT_DIR = BASE_OUTPUT_DIR / CURRENT_MONTH_FOLDER
 
+AMP_ALLOWED_GROUPS_OVERRIDE: Optional[set[str]] = None
+TENABLE_ALLOWED_TARGETS_OVERRIDE: Optional[set[tuple[str, str]]] = None
+
 TEMPLATE_ENTITY_NAME = "Argentina"
 TEMPLATE_PERIOD_TEXT: Optional[str] = None
 REPLACE_TEXT_INSIDE_DOCX = False
@@ -112,32 +115,39 @@ def require_exists(path: Path, label: str) -> None:
         raise FileNotFoundError(f"No existe {label}: {path}")
 
 
-def run_amp_unified(workdir: Path, start_utc: datetime, end_utc: datetime) -> Path:
-    global AMP_START_UTC_OVERRIDE, AMP_END_UTC_OVERRIDE, OUTPUT_ROOT
+def run_amp_unified(workdir: Path, start_utc: datetime, end_utc: datetime, allowed_amp: Optional[set[str]] = None) -> Path:
+    global AMP_START_UTC_OVERRIDE, AMP_END_UTC_OVERRIDE, OUTPUT_ROOT, AMP_ALLOWED_GROUPS_OVERRIDE
     old_cwd = Path.cwd()
+    old_allowed = AMP_ALLOWED_GROUPS_OVERRIDE
     try:
         os.chdir(workdir)
         AMP_START_UTC_OVERRIDE = start_utc
         AMP_END_UTC_OVERRIDE = end_utc
+        AMP_ALLOWED_GROUPS_OVERRIDE = set(allowed_amp) if allowed_amp is not None else None
         OUTPUT_ROOT = os.path.join(os.getcwd(), "amp_reportes_unificado")
         amp_main()
     finally:
         AMP_START_UTC_OVERRIDE = None
         AMP_END_UTC_OVERRIDE = None
+        AMP_ALLOWED_GROUPS_OVERRIDE = old_allowed
         os.chdir(old_cwd)
     amp_root = workdir / "amp_reportes_unificado"
     require_exists(amp_root, "salida AMP")
     return amp_root
 
 
-def run_tenable_unified(workdir: Path, output_dir: Path) -> Path:
+def run_tenable_unified(workdir: Path, output_dir: Path, allowed_tenable: Optional[set[tuple[str, str]]] = None) -> Path:
+    global TENABLE_ALLOWED_TARGETS_OVERRIDE
     old_cwd = Path.cwd()
     old_env = os.environ.get("TENABLE_REPORTS_OUT_DIR")
+    old_allowed = TENABLE_ALLOWED_TARGETS_OVERRIDE
     try:
+        TENABLE_ALLOWED_TARGETS_OVERRIDE = set(allowed_tenable) if allowed_tenable is not None else None
         os.environ["TENABLE_REPORTS_OUT_DIR"] = str(output_dir)
         os.chdir(workdir)
         run_all()
     finally:
+        TENABLE_ALLOWED_TARGETS_OVERRIDE = old_allowed
         os.chdir(old_cwd)
         if old_env is None:
             os.environ.pop("TENABLE_REPORTS_OUT_DIR", None)
@@ -293,6 +303,12 @@ def filter_targets(targets: Sequence[Target], only: Optional[Sequence[str]]) -> 
     return out
 
 
+def build_allowed_target_sets(selected_targets: Sequence[Target]) -> tuple[set[str], set[tuple[str, str]]]:
+    allowed_amp = {norm(t.amp_name) for t in selected_targets}
+    allowed_tenable = {(norm(t.tenable_category), norm(t.tenable_value)) for t in selected_targets}
+    return allowed_amp, allowed_tenable
+
+
 def dedupe_keep_order(items: List[str]) -> List[str]:
     seen = set()
     out = []
@@ -399,6 +415,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("[ERR] No hubo coincidencias en TARGETS para --solo.")
         return 2
 
+    allowed_amp, allowed_tenable = build_allowed_target_sets(selected_targets)
+
     if args.template:
         template_docx = Path(args.template)
         now = datetime.now(timezone.utc)
@@ -425,13 +443,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("[INFO] Generando imágenes de AMP...")
         amp_root: Optional[Path] = None
         try:
-            amp_root = run_amp_unified(amp_workdir, start_utc, end_utc)
+            amp_root = run_amp_unified(amp_workdir, start_utc, end_utc, allowed_amp=allowed_amp)
         except Exception as e:
             print(f"[WARN] No se pudieron generar imágenes de AMP ({e}). Se continuará con imágenes AMP originales del template.")
 
         print("[INFO] Generando imágenes de Tenable...")
         tenable_root = tenable_workdir / "tenable_reportes_unificados"
-        tenable_root = run_tenable_unified(tenable_workdir, tenable_root)
+        tenable_root = run_tenable_unified(tenable_workdir, tenable_root, allowed_tenable=allowed_tenable)
 
         amp_dirs = list_amp_group_dirs(amp_root) if amp_root else {}
         tenable_dirs = list_tenable_tag_dirs(tenable_root)
@@ -1630,6 +1648,11 @@ def amp_main():
     ensure_dir(out_root)
 
     groups = amp.get_groups()
+    allowed_amp = globals().get("AMP_ALLOWED_GROUPS_OVERRIDE")
+    if allowed_amp is not None:
+        before = len(groups)
+        groups = _filter_existing_amp_groups(groups, allowed_amp)
+        print(f"✅ Groups filtrados por TARGETS existentes: {len(groups)} de {before}")
     print(f"✅ Groups detectados: {len(groups)}")
     print(f"✅ Rango UTC (events): start={iso_utc_compromises(start_utc)} | end={iso_utc_compromises(end_utc)}")
 
@@ -1839,8 +1862,36 @@ def _iter_jsonl_gz_records(path: str):
                 continue
 
 
+def _tenable_allowed_targets_override() -> Optional[set[tuple[str, str]]]:
+    allowed = globals().get("TENABLE_ALLOWED_TARGETS_OVERRIDE")
+    if allowed is None:
+        return None
+    return set(allowed)
+
+
+def _filter_tag_pairs_by_allowed(tags: List[tuple[str, str]], allowed: Optional[set[tuple[str, str]]]) -> List[tuple[str, str]]:
+    if allowed is None:
+        return tags
+    return [(cat, val) for (cat, val) in tags if (norm(cat), norm(val)) in allowed]
+
+
+def _is_tag_allowed(cat: str, val: str, allowed: Optional[set[tuple[str, str]]]) -> bool:
+    if allowed is None:
+        return True
+    return (norm(cat), norm(val)) in allowed
+
+
+def _filter_existing_amp_groups(groups: List[Dict[str, Any]], allowed_amp: Optional[set[str]]) -> List[Dict[str, Any]]:
+    if allowed_amp is None:
+        return groups
+    existing = {norm(g.get("name", "")) for g in groups}
+    valid_allowed = allowed_amp & existing
+    return [g for g in groups if norm(g.get("name", "")) in valid_allowed]
+
+
 def _run_controlesCIS_from_cached_export(ns, dataset_path: str, base_out: str,
-                                        rows_to_show: int = 12, assets_per_row: int = 3) -> int:
+                                        rows_to_show: int = 12, assets_per_row: int = 3,
+                                        allowed_tenable: Optional[set[tuple[str, str]]] = None) -> int:
     """
     Ejecuta la lógica de 'controlesCIS.py' pero REUSANDO el mismo compliance export
     descargado (compliance_export_all.jsonl.gz), evitando volver a bajar chunks.
@@ -1852,6 +1903,9 @@ def _run_controlesCIS_from_cached_export(ns, dataset_path: str, base_out: str,
     # 1) Descubre tags (llamada ligera)
     session = _requests.Session()
     tags = ns["discover_all_tags"](session)
+    tags = _filter_tag_pairs_by_allowed(tags, allowed_tenable)
+    if not tags:
+        print("[INFO] (cis-host-audits) Sin tags permitidos tras aplicar filtro; no se generarán imágenes por tag.")
     allowed_tags = set(tags)
 
     # 2) Agrega por tag usando el dataset ya descargado
@@ -1911,7 +1965,7 @@ def _run_controlesCIS_from_cached_export(ns, dataset_path: str, base_out: str,
     return 0
 
 
-def _run_tenable_images_per_tag(base_out: str) -> int:
+def _run_tenable_images_per_tag(base_out: str, allowed_tenable: Optional[set[tuple[str, str]]] = None) -> int:
     """
     Ejecuta el módulo 'Tenable_images - funciona.py' pero guardando
     sus 3 imágenes dentro de la carpeta del TAG: base_out/<cat>/<val>/.
@@ -1940,6 +1994,15 @@ def _run_tenable_images_per_tag(base_out: str) -> int:
     sess = make_session()
     print(f"[INFO] (vm-vulns) Descubriendo tags en categorías: {', '.join(ns.get('WANTED_CATEGORIES', []))} ...")
     targets = discover_targets(sess)
+    discovered_count = len(targets)
+    targets = [
+        t for t in targets
+        if _is_tag_allowed(t.get("tag_category", ""), t.get("tag_value", ""), allowed_tenable)
+    ]
+    if allowed_tenable is not None:
+        print(f"[INFO] (vm-vulns) Tags existentes={discovered_count} | permitidos+existentes={len(targets)}")
+    if allowed_tenable is not None and not targets:
+        print("[INFO] (vm-vulns) Sin tags permitidos tras aplicar filtro; no se generarán imágenes por tag.")
     print(f"[INFO] (vm-vulns) Tags descubiertas: {len(targets)}")
 
     # Guardar targets descubiertos
@@ -1995,6 +2058,7 @@ def _run_tenable_images_per_tag(base_out: str) -> int:
 
 def run_all() -> int:
     base_out = _unified_out_dir()
+    allowed_tenable = _tenable_allowed_targets_override()
     os.makedirs(base_out, exist_ok=True)
 
     if not TENABLE_ACCESS_KEY or not TENABLE_SECRET_KEY:
@@ -2016,9 +2080,13 @@ def run_all() -> int:
         # Cachea tags una sola vez (los 2 módulos CIS requieren el mismo listado)
         try:
             _s = requests.Session()
-            cached_tags = ns["list_tag_values"](_s)
-            if cached_tags:
-                ns["list_tag_values"] = (lambda _session, _t=cached_tags: _t)
+            discovered_tags = ns["list_tag_values"](_s)
+            cached_tags = _filter_tag_pairs_by_allowed(discovered_tags, allowed_tenable)
+            if allowed_tenable is not None:
+                print(f"[INFO] (cis-controls) Tags existentes={len(discovered_tags)} | permitidos+existentes={len(cached_tags)}")
+            if allowed_tenable is not None and not cached_tags:
+                print("[INFO] (cis-controls) Sin tags permitidos tras aplicar filtro; módulo continuará sin tags para salida por tag.")
+            ns["list_tag_values"] = (lambda _session, _t=cached_tags: _t)
         except Exception:
             cached_tags = None
 
@@ -2042,13 +2110,20 @@ def run_all() -> int:
         ns = _load_embedded_module("controlesCIS")
 
         # Reutiliza el listado de tags ya consultado en cis-controls (evita otra llamada a /tags/values)
-        if cached_tags:
+        if cached_tags is not None:
             ns["discover_all_tags"] = (lambda _session, _t=cached_tags: _t)
 
         dataset_path = os.path.join(base_out, "compliance_export_all.jsonl.gz")
 
         if os.path.isfile(dataset_path):
-            rc = _run_controlesCIS_from_cached_export(ns, dataset_path, base_out, rows_to_show=12, assets_per_row=3)
+            rc = _run_controlesCIS_from_cached_export(
+                ns,
+                dataset_path,
+                base_out,
+                rows_to_show=12,
+                assets_per_row=3,
+                allowed_tenable=allowed_tenable,
+            )
         else:
             # Fallback (si cis-controls falló): aquí sí hará export (solo para no dejarte sin imágenes)
             print("[WARN] No existe compliance_export_all.jsonl.gz; se hará export directo (fallback).")
@@ -2064,7 +2139,7 @@ def run_all() -> int:
 # 3) VM vulns (severidad + top10 + spotlight) -> guardando dentro de carpeta del TAG
     try:
         print("\n=== Ejecutando: vm-vulns ===")
-        rc = _run_tenable_images_per_tag(base_out)
+        rc = _run_tenable_images_per_tag(base_out, allowed_tenable=allowed_tenable)
         if rc != 0:
             rc_total = rc_total or rc
             print(f"[WARN] vm-vulns terminó con código {rc}")
@@ -2089,16 +2164,20 @@ def run_all() -> int:
         rc_total = rc_total or 1
         print(f"[ERR] identity: {e}")
 
-    # Copiar identity a todas las carpetas de tag (si existe)
+    # Copiar identity a carpetas de tag permitidas (si existe)
     try:
         if os.path.isfile(identity_path):
             for tag_dir in _iter_tag_dirs(base_out):
+                rel = os.path.relpath(tag_dir, base_out)
+                parts = rel.split(os.sep)
+                if len(parts) >= 2 and not _is_tag_allowed(parts[0], parts[1], allowed_tenable):
+                    continue
                 dst = os.path.join(tag_dir, os.path.basename(identity_path))
                 try:
                     shutil.copy2(identity_path, dst)
                 except Exception:
                     pass
-            print("\n[OK] identity_exposure_donuts_4k.png copiada a todas las carpetas de TAG.")
+            print("\n[OK] identity_exposure_donuts_4k.png copiada a carpetas de TAG permitidas.")
     except Exception:
         pass
 
