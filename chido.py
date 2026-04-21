@@ -655,6 +655,24 @@ def choose_period_interactive() -> Tuple[datetime, datetime, str, str, bool]:
     return start, end, period, period, True
 
 
+def choose_generation_mode_interactive() -> str:
+    return _interactive_select(
+        "Selecciona modo de generación",
+        ["Generar todos los reportes", "Generar un reporte específico"],
+    )
+
+
+def choose_single_target_interactive(targets: Sequence[Target]) -> Target:
+    if not targets:
+        raise RuntimeError("No hay entidades disponibles para seleccionar.")
+    options = [t.display_name for t in targets]
+    selected_name = _interactive_select("Selecciona entidad", options)
+    for target in targets:
+        if target.display_name == selected_name:
+            return target
+    raise RuntimeError("No se pudo resolver la entidad seleccionada.")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     global OUTPUT_DIR, REPORT_PERIOD, REPORT_PERIOD_DOCX
 
@@ -664,11 +682,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     selected_targets = filter_targets(TARGETS, args.solo)
-    if not selected_targets:
+    if args.solo and not selected_targets:
         print("[ERR] No hubo coincidencias en TARGETS para --solo.")
         return 2
-
-    allowed_amp, allowed_tenable = build_allowed_target_sets(selected_targets)
 
     if args.template:
         template_docx = Path(args.template)
@@ -682,6 +698,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         template_docx = choose_template_interactive(BASE_DIR)
         start_utc, end_utc, REPORT_PERIOD, month_folder, manual_month_year = choose_period_interactive()
         REPORT_PERIOD_DOCX = format_period_for_docx(month_folder, manual_month_year=manual_month_year)
+        if not args.solo:
+            mode = choose_generation_mode_interactive()
+            if mode == "Generar un reporte específico":
+                selected_targets = [choose_single_target_interactive(TARGETS)]
+            else:
+                selected_targets = list(TARGETS)
+
+    if not selected_targets:
+        print("[ERR] No hay entidades seleccionadas para generar reportes.")
+        return 2
+
+    allowed_amp, allowed_tenable = build_allowed_target_sets(selected_targets)
 
     require_exists(template_docx, "TEMPLATE_DOCX")
     template_media = inspect_template_media(template_docx)
@@ -1217,8 +1245,8 @@ COMPROMISE_EVENT_TYPES = {
     "AnyDesk Suspicious File Creation",
 }
 
-C_CARD_W, C_CARD_H = 1600, 1200
-C_MARGIN = 56
+C_CARD_W, C_CARD_H = 1920, 1440
+C_MARGIN = 72
 
 C_COL_BG = (255, 255, 255)
 C_COL_BORDER = (230, 230, 230)
@@ -1244,9 +1272,9 @@ def c_load_font(size: int):
             continue
     return ImageFont.load_default()
 
-C_FONT_TITLE = c_load_font(68)
-C_FONT_H2 = c_load_font(42)
-C_FONT_BODY = c_load_font(32)
+C_FONT_TITLE = c_load_font(78)
+C_FONT_H2 = c_load_font(48)
+C_FONT_BODY = c_load_font(36)
 
 def c_shorten(s: str, n: int = 30) -> str:
     s = s or ""
@@ -1305,7 +1333,7 @@ def render_compromises_card(compromise_events: List[dict], outpath: str):
     in_prog = 0
     resolved = 0
 
-    y0 = 170
+    y0 = 220
     d.text(
         (C_MARGIN, y0),
         f"{total} Compromises total - {in_prog} In Progress - {resolved} Resolved",
@@ -1313,34 +1341,34 @@ def render_compromises_card(compromise_events: List[dict], outpath: str):
         font=C_FONT_BODY,
     )
 
-    c_draw_hbar(d, C_MARGIN, y0 + 62, C_CARD_W - 2 * C_MARGIN, 40, total, max(1, total), C_COL_RED)
+    c_draw_hbar(d, C_MARGIN, y0 + 72, C_CARD_W - 2 * C_MARGIN, 44, total, max(1, total), C_COL_RED)
 
-    c_section_title(d, C_MARGIN, y0 + 132, "By Event")
+    c_section_title(d, C_MARGIN, y0 + 170, "By Event")
     top_ev = c_top_counts(event_types, 5)
     maxv = top_ev[0][1] if top_ev else 1
 
-    bar_x = C_MARGIN + 620
-    bar_w = C_CARD_W - bar_x - 150
-    cnt_x = C_CARD_W - 110
-    row_h = 66
+    bar_x = C_MARGIN + 760
+    bar_w = C_CARD_W - bar_x - 180
+    cnt_x = C_CARD_W - 130
+    row_h = 74
 
-    y = y0 + 200
+    y = y0 + 245
     for name, val in top_ev:
         c_label_linklike(d, C_MARGIN, y, c_shorten(name, 42))
         color = C_COL_ORANGE if val == maxv else C_COL_YELLOW
-        c_draw_hbar(d, bar_x, y + 12, bar_w, 30, val, maxv, color)
+        c_draw_hbar(d, bar_x, y + 14, bar_w, 34, val, maxv, color)
         d.text((cnt_x, y + 1), str(val), fill=C_COL_TEXT, font=C_FONT_BODY)
         y += row_h
 
-    c_section_title(d, C_MARGIN, y + 30, "By Host")
+    c_section_title(d, C_MARGIN, y + 38, "By Host")
     top_h = c_top_counts(hosts, 5)
     maxh = top_h[0][1] if top_h else 1
 
-    y2 = y + 95
+    y2 = y + 112
     for name, val in top_h:
         c_label_linklike(d, C_MARGIN, y2, c_shorten(name, 44))
         color = C_COL_ORANGE if val == maxh else C_COL_YELLOW
-        c_draw_hbar(d, bar_x, y2 + 12, bar_w, 30, val, maxh, color)
+        c_draw_hbar(d, bar_x, y2 + 14, bar_w, 34, val, maxh, color)
         d.text((cnt_x, y2 + 1), str(val), fill=C_COL_TEXT, font=C_FONT_BODY)
         y2 += row_h
 
@@ -1364,8 +1392,8 @@ THREATS_RELEVANT_EVENT_TYPE_IDS = {
     EVENT_ID_CLOUD_RECALL_QUARANTINE_SUCCESS,
 }
 
-T_CARD_W, T_CARD_H = 1600, 1280
-T_MARGIN = 56
+T_CARD_W, T_CARD_H = 1920, 1460
+T_MARGIN = 72
 
 T_COL_BG = (255, 255, 255)
 T_COL_BORDER = (230, 230, 230)
@@ -1397,9 +1425,9 @@ def t_load_font(size: int, bold: bool = False):
                 pass
     return ImageFont.load_default()
 
-T_FONT_TITLE = t_load_font(68, bold=True)
-T_FONT_H2    = t_load_font(42, bold=True)
-T_FONT_BODY  = t_load_font(32, bold=False)
+T_FONT_TITLE = t_load_font(78, bold=True)
+T_FONT_H2    = t_load_font(48, bold=True)
+T_FONT_BODY  = t_load_font(36, bold=False)
 
 def t_shorten(s: str, n: int) -> str:
     s = str(s or "")
@@ -1665,43 +1693,43 @@ def render_threats_card(unique_threats: List[dict], outpath: str):
 
     top_th = t_top_counts(threat_names, 2)
 
-    y0 = 165
+    y0 = 210
 
     t_section_title(d, T_MARGIN, y0, "Root Cause")
-    donut_cx = T_MARGIN + 190
-    donut_cy = y0 + 230
-    t_draw_donut(d, donut_cx, donut_cy, 132, 80, T_COL_PURPLE)
-    d.rectangle([T_MARGIN + 390, y0 + 180, T_MARGIN + 426, y0 + 216], fill=T_COL_PURPLE)
-    t_label_linklike(d, T_MARGIN + 445, y0 + 170, t_shorten(top_file_name, 50))
+    donut_cx = T_MARGIN + 220
+    donut_cy = y0 + 250
+    t_draw_donut(d, donut_cx, donut_cy, 148, 92, T_COL_PURPLE)
+    d.rectangle([T_MARGIN + 450, y0 + 200, T_MARGIN + 492, y0 + 242], fill=T_COL_PURPLE)
+    t_label_linklike(d, T_MARGIN + 520, y0 + 190, t_shorten(top_file_name, 56))
 
-    t_section_title(d, T_MARGIN, y0 + 430, "Resolution")
-    bar_x, bar_w, bar_h = T_MARGIN + 620, 760, 32
-    row_y = y0 + 500
+    t_section_title(d, T_MARGIN, y0 + 470, "Resolution")
+    bar_x, bar_w, bar_h = T_MARGIN + 760, 950, 36
+    row_y = y0 + 560
     max_res = max(1, res_counter["Quarantined"], res_counter["Quarantine Failed"])
 
     t_label_linklike(d, T_MARGIN, row_y - 8, "Quarantined")
     t_draw_hbar(d, bar_x, row_y, bar_w, bar_h, res_counter["Quarantined"], max_res, T_COL_YELLOW)
     d.text((T_CARD_W - 110, row_y - 10), str(res_counter["Quarantined"]), fill=T_COL_TEXT, font=T_FONT_BODY)
 
-    row_y2 = row_y + 70
+    row_y2 = row_y + 84
     t_label_linklike(d, T_MARGIN, row_y2 - 8, "Quarantine Failed")
     t_draw_hbar(d, bar_x, row_y2, bar_w, bar_h, res_counter["Quarantine Failed"], max_res, T_COL_RED)
     d.text((T_CARD_W - 110, row_y2 - 10), str(res_counter["Quarantine Failed"]), fill=T_COL_TEXT, font=T_FONT_BODY)
 
-    t_section_title(d, T_MARGIN, y0 + 660, "By Host")
-    y_host = y0 + 730
-    t_label_linklike(d, T_MARGIN, y_host - 8, t_shorten(top_host_name, 44))
+    t_section_title(d, T_MARGIN, y0 + 760, "By Host")
+    y_host = y0 + 845
+    t_label_linklike(d, T_MARGIN, y_host - 8, t_shorten(top_host_name, 54))
     t_draw_hbar(d, bar_x, y_host, bar_w, bar_h, top_host_count, max(1, top_host_count), T_COL_YELLOW)
     d.text((T_CARD_W - 110, y_host - 10), str(top_host_count), fill=T_COL_TEXT, font=T_FONT_BODY)
 
-    t_section_title(d, T_MARGIN, y0 + 850, "By Threat Name")
-    y_th = y0 + 920
+    t_section_title(d, T_MARGIN, y0 + 980, "By Threat Name")
+    y_th = y0 + 1065
     max_th = top_th[0][1] if top_th else 1
 
     if top_th:
         for i, (nm, val) in enumerate(top_th):
-            yy = y_th + i * 70
-            t_label_linklike(d, T_MARGIN, yy - 8, t_shorten(nm, 50))
+            yy = y_th + i * 84
+            t_label_linklike(d, T_MARGIN, yy - 8, t_shorten(nm, 56))
             t_draw_hbar(d, bar_x, yy, bar_w, bar_h, val, max_th, T_COL_YELLOW)
             d.text((T_CARD_W - 110, yy - 10), str(val), fill=T_COL_TEXT, font=T_FONT_BODY)
     else:
@@ -1716,8 +1744,8 @@ def render_threats_card(unique_threats: List[dict], outpath: str):
 # ============================================================
 # 7) DEVICES (del Amp_todo.py) - DISEÑO + LOGICA IGUAL
 # ============================================================
-D_CARD_W, D_CARD_H = 1400, 900
-D_MARGIN = 48
+D_CARD_W, D_CARD_H = 1760, 1140
+D_MARGIN = 64
 
 D_COL_BG = (255, 255, 255)
 D_COL_BORDER = (230, 230, 230)
@@ -1747,9 +1775,9 @@ def d_load_font(size: int, bold: bool = False):
                 pass
     return ImageFont.load_default()
 
-D_FONT_TITLE = d_load_font(66, bold=True)
-D_FONT_H2    = d_load_font(38, bold=True)
-D_FONT_BODY  = d_load_font(30, bold=False)
+D_FONT_TITLE = d_load_font(76, bold=True)
+D_FONT_H2    = d_load_font(44, bold=True)
+D_FONT_BODY  = d_load_font(34, bold=False)
 
 def d_norm(x: Any) -> str:
     return (str(x) if x is not None else "").strip()
@@ -1893,35 +1921,35 @@ def d_draw_version_bar(d: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int, s
 def render_devices_card(top_os: str, supported: int, unsupported: int, outpath: str, empty_note: bool):
     img, d = d_draw_card_base("Devices")
 
-    y0 = 165
+    y0 = 210
 
     d_section_title(d, D_MARGIN, y0, "By Host")
-    donut_cx = D_MARGIN + 180
-    donut_cy = y0 + 200
-    d_draw_donut(d, donut_cx, donut_cy, 120, 72, D_COL_PURPLE)
+    donut_cx = D_MARGIN + 210
+    donut_cy = y0 + 230
+    d_draw_donut(d, donut_cx, donut_cy, 142, 86, D_COL_PURPLE)
 
-    d.rectangle([D_MARGIN + 360, y0 + 160, D_MARGIN + 396, y0 + 196], fill=D_COL_PURPLE)
-    d_label_linklike(d, D_MARGIN + 420, y0 + 150, top_os)
+    d.rectangle([D_MARGIN + 430, y0 + 188, D_MARGIN + 472, y0 + 230], fill=D_COL_PURPLE)
+    d_label_linklike(d, D_MARGIN + 500, y0 + 176, top_os)
 
-    VD_Y = y0 + 390
+    VD_Y = y0 + 470
     d_section_title(d, D_MARGIN, VD_Y, "Version Deployment")
 
-    d_label_normal(d, D_MARGIN, VD_Y + 70, "Update Status", D_COL_TEXT)
+    d_label_normal(d, D_MARGIN, VD_Y + 76, "Update Status", D_COL_TEXT)
 
-    d_label_linklike(d, D_MARGIN + 340, VD_Y + 70, f"{supported} Supported")
-    d.text((D_MARGIN + 840, VD_Y + 70), f"{unsupported} Unsupported", fill=D_COL_YELLOW, font=D_FONT_BODY)
+    d_label_linklike(d, D_MARGIN + 460, VD_Y + 76, f"{supported} Supported")
+    d.text((D_MARGIN + 1090, VD_Y + 76), f"{unsupported} Unsupported", fill=D_COL_YELLOW, font=D_FONT_BODY)
 
-    d_label_linklike(d, D_MARGIN, VD_Y + 140, "Windows")
+    d_label_linklike(d, D_MARGIN, VD_Y + 164, "Windows")
 
-    bar_x = D_MARGIN + 340
-    bar_y = VD_Y + 152
-    bar_w = 850
-    bar_h = 32
+    bar_x = D_MARGIN + 460
+    bar_y = VD_Y + 176
+    bar_w = 1080
+    bar_h = 38
 
     d.rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], fill=(230, 230, 230))
     d_draw_version_bar(d, bar_x, bar_y, bar_w, bar_h, supported, unsupported)
 
-    d_label_normal(d, bar_x + bar_w + 18, VD_Y + 137, f"{supported} / {unsupported}", D_COL_TEXT)
+    d_label_normal(d, bar_x + bar_w + 20, VD_Y + 160, f"{supported} / {unsupported}", D_COL_TEXT)
 
     if empty_note:
         d.text((D_MARGIN, D_CARD_H - 95), "No endpoints in this group", fill=D_COL_GRAY, font=D_FONT_BODY)
