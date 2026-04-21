@@ -1312,8 +1312,8 @@ def c_label_linklike(d: ImageDraw.ImageDraw, x: int, y: int, text: str):
 def render_compromises_card(compromise_events: List[dict], outpath: str):
     event_types = [c_extract_event_type(e) for e in compromise_events]
     hosts = [c_extract_host(e) for e in compromise_events]
-    top_ev = c_top_counts(event_types, 8)
-    top_h = c_top_counts(hosts, 8)
+    top_ev = c_top_counts(event_types, 5)
+    top_h = c_top_counts(hosts, 5)
 
     card_w, card_h = c_calc_card_size(len(top_ev), len(top_h))
     img, d = c_draw_card_base("Compromises", card_w, card_h)
@@ -1684,7 +1684,7 @@ def render_threats_card(unique_threats: List[dict], outpath: str):
     top_host = t_top_counts(hosts, 1)
     top_host_name, top_host_count = (top_host[0] if top_host else ("No data", 0))
 
-    top_th = t_top_counts(threat_names, 4)
+    top_th = t_top_counts(threat_names, 2)
     card_w, _ = t_calc_card_size(len(top_th))
     card_h = max(T_CARD_H_MIN, T_MARGIN_Y + 1180 + max(2, len(top_th)) * 96 + T_MARGIN_Y)
     img, d = t_draw_card_base("Threats", card_w, card_h)
