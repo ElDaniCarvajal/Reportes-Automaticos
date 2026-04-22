@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import email.utils
 import os
 import re
 import sys
@@ -150,10 +151,69 @@ def require_exists(path: Path, label: str) -> None:
         raise FileNotFoundError(f"No existe {label}: {path}")
 
 
+class AmpConnectivityError(RuntimeError):
+    """Fallo transitorio de conectividad hacia AMP (DNS/red/timeout/5xx/429)."""
+
+
+class TenableConnectivityError(RuntimeError):
+    """Fallo transitorio de conectividad hacia Tenable (DNS/red/timeout/429/5xx)."""
+
+
+def _looks_like_dns_error(exc: BaseException) -> bool:
+    text = str(exc)
+    tokens = (
+        "NameResolutionError",
+        "Failed to resolve",
+        "Temporary failure in name resolution",
+        "nodename nor servname provided",
+        "Name or service not known",
+        "getaddrinfo failed",
+    )
+    return any(t.lower() in text.lower() for t in tokens)
+
+
+def _is_amp_connectivity_failure(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    if isinstance(exc, AmpConnectivityError):
+        return True
+    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        return True
+    if any(token in msg for token in ("http 429", "http 500", "http 502", "http 503", "http 504")):
+        return True
+    return _looks_like_dns_error(exc)
+
+
+def _is_tenable_connectivity_failure(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    if isinstance(exc, TenableConnectivityError):
+        return True
+    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        return True
+    if any(token in msg for token in (
+        "failed to resolve",
+        "nameresolutionerror",
+        "temporary failure in name resolution",
+        "connection reset",
+        "connection aborted",
+        "max retries exceeded",
+        "timeout",
+        "timed out",
+        "http 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+    )):
+        return True
+    return False
+
+
 def run_amp_unified(workdir: Path, start_utc: datetime, end_utc: datetime, allowed_amp: Optional[set[str]] = None) -> Path:
     global AMP_START_UTC_OVERRIDE, AMP_END_UTC_OVERRIDE, OUTPUT_ROOT, AMP_ALLOWED_GROUPS_OVERRIDE
     old_cwd = Path.cwd()
     old_allowed = AMP_ALLOWED_GROUPS_OVERRIDE
+    max_attempts = 3
+    base_wait = 10
     try:
         os.chdir(workdir)
         AMP_START_UTC_OVERRIDE = start_utc
@@ -161,7 +221,31 @@ def run_amp_unified(workdir: Path, start_utc: datetime, end_utc: datetime, allow
         AMP_ALLOWED_GROUPS_OVERRIDE = set(allowed_amp) if allowed_amp is not None else None
         OUTPUT_ROOT = os.path.join(os.getcwd(), "amp_reportes_unificado")
         print(f"[DEBUG][AMP] OUTPUT_ROOT configurado en: {OUTPUT_ROOT}")
-        amp_main()
+        recovered = False
+        last_error: Optional[Exception] = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                amp_main()
+                if attempt > 1:
+                    recovered = True
+                    print(f"[INFO][AMP] run_amp_unified recuperado en intento {attempt}/{max_attempts}.")
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                if _is_amp_connectivity_failure(e) and attempt < max_attempts:
+                    wait_s = base_wait * attempt
+                    print(f"[WARN][AMP] run_amp_unified intento {attempt}/{max_attempts} falló por conectividad: {e}")
+                    print(f"[INFO][AMP] reintentando ejecución completa en {wait_s}s")
+                    time.sleep(wait_s)
+                    continue
+                if _is_amp_connectivity_failure(e):
+                    print(f"[WARN][AMP] run_amp_unified agotó reintentos ({attempt}/{max_attempts}) por conectividad: {e}")
+                raise
+        if last_error is not None:
+            raise last_error
+        if not recovered:
+            print("[INFO][AMP] run_amp_unified completado sin necesidad de reintentos externos.")
     finally:
         AMP_START_UTC_OVERRIDE = None
         AMP_END_UTC_OVERRIDE = None
@@ -178,11 +262,32 @@ def run_tenable_unified(workdir: Path, output_dir: Path, allowed_tenable: Option
     old_cwd = Path.cwd()
     old_env = os.environ.get("TENABLE_REPORTS_OUT_DIR")
     old_allowed = TENABLE_ALLOWED_TARGETS_OVERRIDE
+    max_attempts = 3
+    base_wait = 8
     try:
-        TENABLE_ALLOWED_TARGETS_OVERRIDE = set(allowed_tenable) if allowed_tenable is not None else None
-        os.environ["TENABLE_REPORTS_OUT_DIR"] = str(output_dir)
-        os.chdir(workdir)
-        run_all()
+        recovered = False
+        for attempt in range(1, max_attempts + 1):
+            try:
+                TENABLE_ALLOWED_TARGETS_OVERRIDE = set(allowed_tenable) if allowed_tenable is not None else None
+                os.environ["TENABLE_REPORTS_OUT_DIR"] = str(output_dir)
+                os.chdir(workdir)
+                run_all()
+                if attempt > 1:
+                    recovered = True
+                    print(f"[INFO][TENABLE] run_tenable_unified recuperado en intento {attempt}/{max_attempts}.")
+                break
+            except Exception as e:
+                if _is_tenable_connectivity_failure(e) and attempt < max_attempts:
+                    wait_s = base_wait * attempt
+                    print(f"[WARN][TENABLE] run_tenable_unified intento {attempt}/{max_attempts} falló por conectividad: {e}")
+                    print(f"[INFO][TENABLE] reintentando ejecución completa en {wait_s}s")
+                    time.sleep(wait_s)
+                    continue
+                if _is_tenable_connectivity_failure(e):
+                    raise TenableConnectivityError(f"Tenable agotó reintentos por conectividad: {e}") from e
+                raise
+        if not recovered:
+            print("[INFO][TENABLE] run_tenable_unified completado sin necesidad de reintentos externos.")
     finally:
         TENABLE_ALLOWED_TARGETS_OVERRIDE = old_allowed
         os.chdir(old_cwd)
@@ -270,7 +375,14 @@ def resolve_tenable_dir(target: Target, tenable_dirs: Dict[Tuple[str, str], Path
     return tenable_dirs.get((norm(target.tenable_category), norm(target.tenable_value)))
 
 
-def collect_images_for_target(target: Target, amp_dir: Optional[Path], tenable_dir: Optional[Path]) -> Tuple[Dict[str, bytes], List[str]]:
+def collect_images_for_target(
+    target: Target,
+    amp_dir: Optional[Path],
+    tenable_dir: Optional[Path],
+    *,
+    amp_generation_failed: bool = False,
+    tenable_generation_failed: bool = False,
+) -> Tuple[Dict[str, bytes], List[str]]:
     replacements: Dict[str, bytes] = {}
     warnings: List[str] = []
     amp_missing_reported = False
@@ -280,10 +392,16 @@ def collect_images_for_target(target: Target, amp_dir: Optional[Path], tenable_d
         root = amp_dir if source == "amp" else tenable_dir
         if root is None:
             if source == "amp" and not amp_missing_reported:
-                warnings.append(f"{target.display_name}: no se encontró carpeta AMP exacta '{target.amp_name}'. Se conservarán imágenes AMP originales.")
+                if amp_generation_failed:
+                    warnings.append(f"{target.display_name}: AMP no se generó por fallo de conectividad; se conservarán imágenes originales del template.")
+                else:
+                    warnings.append(f"{target.display_name}: no se encontró carpeta AMP exacta '{target.amp_name}'. Se conservarán imágenes AMP originales.")
                 amp_missing_reported = True
             elif source == "tenable" and not tenable_missing_reported:
-                warnings.append(f"{target.display_name}: no se encontró carpeta Tenable exacta '{target.tenable_category} -> {target.tenable_value}'. Se conservarán imágenes Tenable originales.")
+                if tenable_generation_failed:
+                    warnings.append(f"{target.display_name}: Tenable no se generó por fallo de conectividad; se conservarán imágenes originales del template.")
+                else:
+                    warnings.append(f"{target.display_name}: no se encontró carpeta Tenable exacta '{target.tenable_category} -> {target.tenable_value}'. Se conservarán imágenes Tenable originales.")
                 tenable_missing_reported = True
             continue
 
@@ -505,14 +623,29 @@ def replace_text_in_docx(
     return stats
 
 
-def build_report_for_target(target: Target, template_path: Path, output_dir: Path, amp_dirs: Dict[str, Path], tenable_dirs: Dict[Tuple[str, str], Path]) -> Tuple[Optional[Path], List[str]]:
+def build_report_for_target(
+    target: Target,
+    template_path: Path,
+    output_dir: Path,
+    amp_dirs: Dict[str, Path],
+    tenable_dirs: Dict[Tuple[str, str], Path],
+    *,
+    amp_generation_failed: bool = False,
+    tenable_generation_failed: bool = False,
+) -> Tuple[Optional[Path], List[str]]:
     amp_dir = resolve_amp_dir(target, amp_dirs)
     tenable_dir = resolve_tenable_dir(target, tenable_dirs)
     if amp_dir:
         for fname in ("compromises.png", "threats.png", "devices.png"):
             fpath = amp_dir / fname
             print(f"[DEBUG][AMP] {target.display_name} -> {fpath} {'[OK]' if fpath.is_file() else '[MISSING]'}")
-    replacements, warnings = collect_images_for_target(target, amp_dir, tenable_dir)
+    replacements, warnings = collect_images_for_target(
+        target,
+        amp_dir,
+        tenable_dir,
+        amp_generation_failed=amp_generation_failed,
+        tenable_generation_failed=tenable_generation_failed,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     out_file = output_dir / output_filename_for(target)
     missing_slots = replace_docx_images(template_path, out_file, replacements)
@@ -734,17 +867,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"[INFO] Temporales en: {tmp_path}")
         print("[INFO] Generando imágenes de AMP...")
         amp_root: Optional[Path] = None
+        amp_generation_failed = False
         try:
             amp_root = run_amp_unified(amp_workdir, start_utc, end_utc, allowed_amp=allowed_amp)
         except Exception as e:
-            print(f"[WARN] No se pudieron generar imágenes de AMP ({e}). Se continuará con imágenes AMP originales del template.")
+            amp_generation_failed = True
+            if _is_amp_connectivity_failure(e):
+                print(f"[WARN][AMP] AMP omitido por conectividad tras reintentos: {e}")
+                print("[WARN][AMP] Se conservarán imágenes originales del template para AMP.")
+            else:
+                print(f"[WARN] No se pudieron generar imágenes de AMP ({e}). Se continuará con imágenes AMP originales del template.")
 
         print("[INFO] Generando imágenes de Tenable...")
         tenable_root = tenable_workdir / "tenable_reportes_unificados"
-        tenable_root = run_tenable_unified(tenable_workdir, tenable_root, allowed_tenable=allowed_tenable)
+        tenable_generation_failed = False
+        try:
+            tenable_root = run_tenable_unified(tenable_workdir, tenable_root, allowed_tenable=allowed_tenable)
+        except Exception as e:
+            tenable_generation_failed = True
+            tenable_root = None
+            if _is_tenable_connectivity_failure(e):
+                print(f"[WARN][TENABLE] Tenable omitido por conectividad tras reintentos: {e}")
+                print("[WARN][TENABLE] Se conservarán imágenes originales del template para Tenable.")
+            else:
+                print(f"[WARN][TENABLE] No se pudieron generar imágenes de Tenable ({e}). Se continuará con imágenes Tenable originales del template.")
 
         amp_dirs = list_amp_group_dirs(amp_root) if amp_root else {}
-        tenable_dirs = list_tenable_tag_dirs(tenable_root)
+        tenable_dirs = list_tenable_tag_dirs(tenable_root) if tenable_root else {}
         print(f"[INFO] Carpetas AMP detectadas: {len(amp_dirs)}")
         if amp_dirs:
             print(f"[DEBUG][AMP] Nombres de grupos AMP detectados (normalizados): {sorted(amp_dirs.keys())}")
@@ -755,7 +904,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         for target in selected_targets:
             print(f"[INFO] Generando DOCX para: {target.display_name}")
-            out_file, warnings = build_report_for_target(target, template_docx, OUTPUT_DIR, amp_dirs, tenable_dirs)
+            out_file, warnings = build_report_for_target(
+                target,
+                template_docx,
+                OUTPUT_DIR,
+                amp_dirs,
+                tenable_dirs,
+                amp_generation_failed=amp_generation_failed,
+                tenable_generation_failed=tenable_generation_failed,
+            )
             all_warnings.extend(warnings)
             if out_file:
                 generated += 1
@@ -962,8 +1119,90 @@ class AmpClient:
         url = f"{self.base_url}/{path.lstrip('/')}"
         return self.s.get(url, params=params, auth=self.auth, timeout=timeout)
 
+    @staticmethod
+    def _is_retryable_status(status_code: int) -> bool:
+        return status_code in {429, 500, 502, 503, 504}
+
+    @staticmethod
+    def _retry_after_seconds(resp: requests.Response) -> Optional[float]:
+        ra = (resp.headers.get("Retry-After") or "").strip()
+        if not ra:
+            return None
+        if ra.isdigit():
+            return float(max(0, int(ra)))
+        try:
+            retry_dt = email.utils.parsedate_to_datetime(ra)
+            if retry_dt is None:
+                return None
+            if retry_dt.tzinfo is None:
+                retry_dt = retry_dt.replace(tzinfo=dt.timezone.utc)
+            now = dt.datetime.now(dt.timezone.utc)
+            return max(0.0, (retry_dt - now).total_seconds())
+        except Exception:
+            return None
+
+    def _get_with_retry(
+        self,
+        path: str,
+        params: Dict[str, Any],
+        *,
+        timeout: int = 60,
+        context: str = "request",
+        max_attempts: int = 6,
+        base_delay: float = 3.0,
+        max_delay: float = 45.0,
+    ) -> requests.Response:
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                r = self._get_raw(path, params=params, timeout=timeout)
+                if self._is_retryable_status(r.status_code):
+                    if attempt >= max_attempts:
+                        detail = f"HTTP {r.status_code}"
+                        raise AmpConnectivityError(f"[AMP] {context} agotó reintentos por {detail}.")
+                    retry_after = self._retry_after_seconds(r)
+                    wait_s = retry_after if retry_after is not None else min(max_delay, base_delay * attempt)
+                    print(f"[WARN][AMP] {context} intento {attempt}/{max_attempts} HTTP {r.status_code}... reintentando en {wait_s:.1f}s")
+                    time.sleep(wait_s)
+                    continue
+                if attempt > 1:
+                    print(f"[INFO][AMP] {context} recuperado en intento {attempt}")
+                return r
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                last_exc = e
+                dns = _looks_like_dns_error(e)
+                reason = "DNS" if dns else e.__class__.__name__
+                if attempt >= max_attempts:
+                    raise AmpConnectivityError(
+                        f"[AMP] {context} agotó reintentos por conectividad ({reason}): {e}"
+                    ) from e
+                wait_s = min(max_delay, base_delay * attempt)
+                print(f"[WARN][AMP] {context} intento {attempt}/{max_attempts} falló por {reason}... reintentando en {wait_s:.1f}s")
+                time.sleep(wait_s)
+            except requests.exceptions.RequestException as e:
+                last_exc = e
+                if _looks_like_dns_error(e):
+                    if attempt >= max_attempts:
+                        raise AmpConnectivityError(
+                            f"[AMP] {context} agotó reintentos por DNS: {e}"
+                        ) from e
+                    wait_s = min(max_delay, base_delay * attempt)
+                    print(f"[WARN][AMP] {context} intento {attempt}/{max_attempts} falló por DNS... reintentando en {wait_s:.1f}s")
+                    time.sleep(wait_s)
+                    continue
+                raise
+
+        raise AmpConnectivityError(f"[AMP] {context} agotó reintentos por conectividad.") from last_exc
+
     def get_groups(self) -> List[Dict[str, str]]:
-        r = self._get_raw("groups", params={"limit": 500}, timeout=60)
+        r = self._get_with_retry(
+            "groups",
+            params={"limit": 500},
+            timeout=60,
+            context="get_groups",
+            max_attempts=6,
+            base_delay=3.0,
+        )
         if r.status_code >= 300:
             raise RuntimeError(f"GET {r.url} failed: {r.status_code} {r.text[:400]}")
         data = r.json().get("data") or []
@@ -1170,12 +1409,38 @@ class AmpClient:
                 "offset": offset,
             }
 
-            while True:
-                r = self._get_raw("events", params=params, timeout=30)
+            max_retries = 8
+            backoff_5xx = 2.0
+            r = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    r = self._get_raw("events", params=params, timeout=30)
+                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                    if attempt >= max_retries:
+                        raise AmpConnectivityError(f"threats/events agotó reintentos por conectividad: {e}") from e
+                    wait_s = min(45.0, attempt * 2.5)
+                    print(f"[WARN][AMP] threats/events intento {attempt}/{max_retries} falló por conectividad... reintentando en {wait_s:.1f}s")
+                    time.sleep(wait_s)
+                    continue
+
                 if r.status_code == 429:
-                    time.sleep(parse_wait_seconds_from_429_threats(r))
+                    wait_s = parse_wait_seconds_from_429_threats(r)
+                    wait_s = min(60.0, wait_s + (attempt - 1) * 1.5)
+                    print(f"[WARN][AMP] threats/events intento {attempt}/{max_retries} HTTP 429... reintentando en {wait_s:.1f}s")
+                    time.sleep(wait_s)
+                    continue
+                if r.status_code >= 500:
+                    if attempt >= max_retries:
+                        break
+                    wait_s = min(60.0, backoff_5xx)
+                    print(f"[WARN][AMP] threats/events intento {attempt}/{max_retries} HTTP {r.status_code}... reintentando en {wait_s:.1f}s")
+                    time.sleep(wait_s)
+                    backoff_5xx = min(60.0, backoff_5xx * 2.0)
                     continue
                 break
+
+            if r is None:
+                raise AmpConnectivityError("threats/events no obtuvo respuesta tras reintentos.")
 
             if r.status_code >= 300:
                 raise RuntimeError(f"GET {r.url} failed: {r.status_code} {r.text[:400]}")
@@ -1218,14 +1483,38 @@ class AmpClient:
     # ----------- Devices method (Computers) -----------
     def get_devices_computers_page(self, limit: int, offset: int) -> Dict[str, Any]:
         params = {"limit": limit, "offset": offset}
-        while True:
-            r = self._get_raw("computers", params=params, timeout=60)
+        max_retries = 8
+        backoff_5xx = 2.0
+        for attempt in range(1, max_retries + 1):
+            try:
+                r = self._get_raw("computers", params=params, timeout=60)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if attempt >= max_retries:
+                    raise AmpConnectivityError(f"devices/computers agotó reintentos por conectividad: {e}") from e
+                wait_s = min(45.0, attempt * 2.5)
+                print(f"[WARN][AMP] devices/computers intento {attempt}/{max_retries} falló por conectividad... reintentando en {wait_s:.1f}s")
+                time.sleep(wait_s)
+                continue
+
             if r.status_code == 429:
-                time.sleep(parse_wait_seconds_from_429_devices(r))
+                wait_s = parse_wait_seconds_from_429_devices(r)
+                wait_s = min(60.0, wait_s + (attempt - 1) * 1.5)
+                print(f"[WARN][AMP] devices/computers intento {attempt}/{max_retries} HTTP 429... reintentando en {wait_s:.1f}s")
+                time.sleep(wait_s)
+                continue
+            if r.status_code >= 500:
+                if attempt >= max_retries:
+                    break
+                wait_s = min(60.0, backoff_5xx)
+                print(f"[WARN][AMP] devices/computers intento {attempt}/{max_retries} HTTP {r.status_code}... reintentando en {wait_s:.1f}s")
+                time.sleep(wait_s)
+                backoff_5xx = min(60.0, backoff_5xx * 2.0)
                 continue
             if r.status_code >= 300:
                 raise RuntimeError(f"GET {r.url} failed: {r.status_code} {r.text[:400]}")
             return r.json()
+
+        raise AmpConnectivityError("devices/computers no obtuvo respuesta exitosa tras reintentos.")
 
 
 # ============================================================
@@ -1955,6 +2244,35 @@ def render_devices_card(top_os: str, supported: int, unsupported: int, outpath: 
     img.save(outpath, "PNG")
 
 
+def _run_amp_group_step_with_retry(
+    *,
+    group_name: str,
+    step_name: str,
+    fn,
+    retries: int = 3,
+    base_sleep: float = 4.0,
+):
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            result = fn()
+            if attempt > 1:
+                print(f"[INFO][AMP][{group_name}] {step_name} recuperado en intento {attempt}/{retries}.")
+            return result
+        except Exception as e:
+            last_exc = e
+            if _is_amp_connectivity_failure(e) and attempt < retries:
+                wait_s = base_sleep * attempt
+                print(f"[WARN][AMP][{group_name}] {step_name} intento {attempt}/{retries} falló por conectividad: {e}")
+                print(f"[INFO][AMP][{group_name}] reintentando {step_name} en {wait_s:.1f}s")
+                time.sleep(wait_s)
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"[AMP][{group_name}] {step_name} agotó reintentos sin excepción explícita.")
+
+
 # ============================================================
 # 8) MAIN (UNIFICADO)
 # ============================================================
@@ -1982,7 +2300,13 @@ def amp_main():
     print(f"✅ Rango UTC (events): start={iso_utc_compromises(start_utc)} | end={iso_utc_compromises(end_utc)}")
 
     # Devices: prefetch computers una sola vez (igual que Amp_todo.py, pero compartiendo auth)
-    computers = iter_all_computers(amp)
+    computers = _run_amp_group_step_with_retry(
+        group_name="TENANT",
+        step_name="devices/computers_prefetch",
+        fn=lambda: iter_all_computers(amp),
+        retries=3,
+        base_sleep=5.0,
+    )
     print(f"✅ Computers tenant: {len(computers)}")
     membership_idx = build_group_membership_index(computers)
     print(f"✅ Group membership index built: {len(membership_idx)} group IDs con endpoints")
@@ -1997,11 +2321,17 @@ def amp_main():
 
         # 1) COMPROMISES -> compromises.png
         try:
-            events_in_range = amp.get_events_in_range_for_group_compromises(
-                group_guid=gguid,
-                start_utc=start_utc,
-                end_utc=end_utc,
-                debug_dir=None,
+            events_in_range = _run_amp_group_step_with_retry(
+                group_name=gname,
+                step_name="compromises/events",
+                fn=lambda: amp.get_events_in_range_for_group_compromises(
+                    group_guid=gguid,
+                    start_utc=start_utc,
+                    end_utc=end_utc,
+                    debug_dir=None,
+                ),
+                retries=3,
+                base_sleep=4.0,
             )
             compromise_events = filter_compromise_events(events_in_range)
 
@@ -2014,7 +2344,13 @@ def amp_main():
 
         # 2) THREATS -> threats.png
         try:
-            events_thr = amp.get_events_last30_for_group_threats(gguid, start_utc, end_utc)
+            events_thr = _run_amp_group_step_with_retry(
+                group_name=gname,
+                step_name="threats/events",
+                fn=lambda: amp.get_events_last30_for_group_threats(gguid, start_utc, end_utc),
+                retries=3,
+                base_sleep=4.0,
+            )
             threats = build_unique_threats_by_detection_id(events_thr)
 
             out_img_thr = os.path.join(out_dir, "threats.png")
@@ -2313,6 +2649,34 @@ def _discover_vm_targets_with_retry(sess, discover_targets_fn, retries: int = 3,
     return []
 
 
+def _run_tenable_tag_with_retry(
+    *,
+    tag_label: str,
+    fn,
+    retries: int = 3,
+    base_sleep: float = 3.0,
+):
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            result = fn()
+            if attempt > 1:
+                print(f"[INFO][TENABLE][{tag_label}] process_tag recuperado en intento {attempt}/{retries}.")
+            return result
+        except Exception as e:
+            last_exc = e
+            if _is_tenable_connectivity_failure(e) and attempt < retries:
+                wait_s = base_sleep * attempt
+                print(f"[WARN][TENABLE][{tag_label}] process_tag intento {attempt}/{retries} falló por conectividad: {e}")
+                print(f"[INFO][TENABLE][{tag_label}] reintentando process_tag en {wait_s:.1f}s")
+                time.sleep(wait_s)
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"[TENABLE][{tag_label}] process_tag agotó reintentos sin excepción explícita.")
+
+
 def _run_controlesCIS_from_cached_export(ns, dataset_path: str, base_out: str,
                                         rows_to_show: int = 12, assets_per_row: int = 3,
                                         allowed_tenable: Optional[set[tuple[str, str]]] = None) -> int:
@@ -2494,7 +2858,12 @@ def _run_tenable_images_per_tag(base_out: str, allowed_tenable: Optional[set[tup
         print(f"[{i}/{len(targets)}] (vm-vulns) Procesando {tag_label}")
 
         try:
-            res = process_tag(sess, t)
+            res = _run_tenable_tag_with_retry(
+                tag_label=tag_label,
+                fn=lambda: process_tag(sess, t),
+                retries=3,
+                base_sleep=3.0,
+            )
 
             tag_dir = os.path.join(base_out, _safe_fs_name(cat), _safe_fs_name(val))
             os.makedirs(tag_dir, exist_ok=True)
