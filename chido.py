@@ -2905,6 +2905,160 @@ def _run_tenable_images_per_tag(base_out: str, allowed_tenable: Optional[set[tup
 
 
 def _identity_counts_from_tenable_one(ns: Dict[str, Any], labels: List[str]) -> Dict[str, Optional[int]]:
+    def _extract_total_local(resp: Any) -> Optional[int]:
+        if not isinstance(resp, dict):
+            return None
+        for k in ("total", "total_count", "totalCount", "count", "hits"):
+            v = resp.get(k)
+            if isinstance(v, int):
+                return v
+            if isinstance(v, (str, float)) and str(v).isdigit():
+                return int(v)
+        for container_key in ("pagination", "page", "meta", "stats"):
+            c = resp.get(container_key)
+            if isinstance(c, dict):
+                for k in ("total", "total_count", "totalCount", "count", "hits", "total_items", "totalItems"):
+                    v = c.get(k)
+                    if isinstance(v, int):
+                        return v
+                    if isinstance(v, (str, float)) and str(v).isdigit():
+                        return int(v)
+        return None
+
+    def _unwrap_items_local(data: Any) -> List[Any]:
+        if data is None:
+            return []
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for k in ("items", "data", "results"):
+                if isinstance(data.get(k), list):
+                    return data[k]
+        return []
+
+    def _is_http_retryable_message(msg: str) -> bool:
+        msg_l = (msg or "").lower()
+        return any(token in msg_l for token in ("http 429", "http 500", "http 502", "http 503", "http 504"))
+
+    def _identity_retry_reason(exc: BaseException) -> str:
+        if isinstance(exc, requests.exceptions.ConnectionError):
+            if _looks_like_dns_error(exc):
+                return "dns"
+            return "network"
+        if isinstance(exc, requests.exceptions.Timeout):
+            return "timeout"
+        if _looks_like_dns_error(exc):
+            return "dns"
+        msg = str(exc)
+        if _is_http_retryable_message(msg):
+            return "http-retryable"
+        return "other"
+
+    def _t1_count_by_mode_with_retry(query_text: str, *, label: str, mode: str, max_attempts: int = 3) -> Optional[int]:
+        to_req = ns.get("to_req")
+        if not callable(to_req):
+            raise RuntimeError("Módulo identity no expone to_req().")
+        path = "/api/v1/t1/inventory/assets/search"
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, max_attempts + 1):
+            body = {"query": {"text": query_text, "mode": mode}}
+            backoff = min(30, 2 * attempt)
+            try:
+                resp = to_req("POST", path, params={"offset": 0, "limit": 1}, json_body=body)
+                total = _extract_total_local(resp)
+                if total is not None:
+                    print(f"[DEBUG][IDENTITY] KPI='{label}' | modo={mode} | intento {attempt}/{max_attempts} | total={total}")
+                    return int(total)
+
+                limit = 500
+                offset = 0
+                seen = 0
+                pages = 0
+                while True:
+                    resp_page = to_req("POST", path, params={"offset": offset, "limit": limit}, json_body=body)
+                    items = _unwrap_items_local(resp_page)
+                    pages += 1
+                    if not items:
+                        break
+                    seen += len(items)
+                    if len(items) < limit:
+                        break
+                    offset += limit
+                print(f"[DEBUG][IDENTITY] KPI='{label}' | modo={mode} | intento {attempt}/{max_attempts} | total={seen} | paginas={pages}")
+                if pages == 1 and seen == 0:
+                    print(f"[WARN][IDENTITY] KPI='{label}' | modo={mode} | intento {attempt}/{max_attempts} | respuesta vacía sospechosa")
+                return int(seen)
+            except Exception as exc:
+                last_exc = exc
+                reason = _identity_retry_reason(exc)
+                if reason in ("dns", "network", "timeout", "http-retryable") and attempt < max_attempts:
+                    if reason == "dns":
+                        print(f"[WARN][IDENTITY] KPI='{label}' | modo={mode} | intento {attempt}/{max_attempts} | error DNS: {exc}")
+                    elif reason in ("network", "timeout"):
+                        print(f"[WARN][IDENTITY] KPI='{label}' | modo={mode} | intento {attempt}/{max_attempts} | error de conectividad: {exc}")
+                    else:
+                        print(f"[WARN][IDENTITY] KPI='{label}' | modo={mode} | intento {attempt}/{max_attempts} | error HTTP retryable: {exc}")
+                    print(f"[DEBUG][IDENTITY] KPI='{label}' | modo={mode} | backoff={backoff}s antes de reintentar")
+                    time.sleep(backoff)
+                    continue
+                if reason == "http-retryable":
+                    print(f"[WARN][IDENTITY] KPI='{label}' | modo={mode} | agotó reintentos por HTTP retryable: {exc}")
+                elif reason in ("dns", "network", "timeout"):
+                    print(f"[WARN][IDENTITY] KPI='{label}' | modo={mode} | agotó reintentos por conectividad: {exc}")
+                else:
+                    print(f"[WARN][IDENTITY] KPI='{label}' | modo={mode} | error no retryable: {exc}")
+                return None if reason in ("dns", "network", "timeout", "http-retryable") else None
+        if last_exc is not None:
+            print(f"[WARN][IDENTITY] KPI='{label}' | modo={mode} | sin resultado tras error: {last_exc}")
+        return None
+
+    def _t1_assets_count_resilient(query_text: str, *, label: str) -> Optional[int]:
+        modes = ["advanced", "tql", "simple"]
+        rounds = 3
+        positive_values: List[int] = []
+        zero_values = 0
+        missing_values = 0
+        mode_non_zero_seen: Dict[str, int] = {}
+
+        for round_idx in range(1, rounds + 1):
+            print(f"[DEBUG][IDENTITY] KPI='{label}' | ronda {round_idx}/{rounds} | iniciando")
+            for mode in modes:
+                total = _t1_count_by_mode_with_retry(query_text, label=label, mode=mode, max_attempts=3)
+                if total is None:
+                    missing_values += 1
+                    continue
+                if total == 0:
+                    zero_values += 1
+                    print(f"[DEBUG][IDENTITY] KPI='{label}' | modo={mode} | intento robusto ronda={round_idx}/{rounds} | total=0")
+                    if label == "Dormant Account":
+                        next_modes = [m for m in modes if m != mode]
+                        if next_modes:
+                            print(f"[WARN][IDENTITY] KPI='{label}' | {mode} devolvió 0, probando {next_modes[0]}")
+                    continue
+                positive_values.append(total)
+                mode_non_zero_seen[mode] = mode_non_zero_seen.get(mode, 0) + 1
+
+            if label == "Dormant Account" and positive_values:
+                chosen = max(positive_values)
+                print(f"[INFO][IDENTITY] KPI='{label}' | se selecciona resultado robusto={chosen}")
+                return chosen
+
+        if positive_values:
+            chosen = max(positive_values)
+            print(f"[INFO][IDENTITY] KPI='{label}' | se selecciona resultado robusto={chosen}")
+            return chosen
+
+        if label == "Dormant Account":
+            if zero_values > 0 and missing_values == 0:
+                print(f"[WARN][IDENTITY] KPI='{label}' quedó en 0 tras reintentos y múltiples modos")
+                return 0
+            if zero_values > 0 and missing_values > 0:
+                print(f"[WARN][IDENTITY] KPI='{label}' mezcla de errores y 0: zeros={zero_values} errores={missing_values}")
+                print(f"[WARN][IDENTITY] KPI='{label}' quedó en 0 tras reintentos y múltiples modos")
+                return 0
+            return None
+        return 0 if zero_values > 0 else None
+
     counts: Dict[str, Optional[int]] = {}
     t1_queries = ns.get("T1_QUERIES", {})
     t1_count = ns.get("t1_assets_count")
@@ -2913,7 +3067,19 @@ def _identity_counts_from_tenable_one(ns: Dict[str, Any], labels: List[str]) -> 
     for label in labels:
         query = t1_queries.get(label)
         print(f"[DEBUG][IDENTITY] KPI='{label}' | modo=Tenable One | query={query}")
-        total = int(t1_count(query))
+        if not query:
+            counts[label] = None
+            print(f"[WARN][IDENTITY] KPI='{label}' | query vacía")
+            continue
+        if label == "Dormant Account":
+            total = _t1_assets_count_resilient(query, label=label)
+        else:
+            one_shot = _t1_count_by_mode_with_retry(query, label=label, mode="advanced", max_attempts=2)
+            if one_shot is None:
+                fallback = _t1_count_by_mode_with_retry(query, label=label, mode="tql", max_attempts=2)
+                total = fallback if fallback is not None else int(t1_count(query))
+            else:
+                total = one_shot
         counts[label] = total
         print(f"[DEBUG][IDENTITY] KPI='{label}' | total={total}")
     return counts
