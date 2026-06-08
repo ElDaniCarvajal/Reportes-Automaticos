@@ -52,41 +52,85 @@ class Target:
     tenable_category: str
     tenable_value: str
     output_filename: Optional[str] = None
+    amp_related_names: Tuple[str, ...] = ()
 
 TARGETS: Tuple[Target, ...] = (
-    Target("Argentina", "ARGENTINA", "Omnilife", "Argentina"),
-    Target("Bolivia", "BOLIVIA", "Omnilife", "Bolivia"),
-    Target("Brasil", "BRASIL", "Omnilife", "Brasil"),
-    Target("Chile", "CHILE", "Omnilife", "Chile"),
-    Target("Colombia", "COLOMBIA", "Omnilife", "Colombia-Todos"),
-    Target("Costa Rica", "COSTA RICA", "Omnilife", "Costa Rica"),
-    Target("Ecuador", "ECUADOR", "Omnilife", "Ecuador"),
-    Target("El Salvador", "EL SALVADOR", "Omnilife", "El Salvador"),
-    Target("España", "ESPAÑA", "Omnilife", "España"),
-    Target("Estados Unidos", "USA", "Omnilife", "Estados Unidos"),
-    Target("Guatemala", "GUATEMALA", "Omnilife", "Guatemala"),
-    Target("Nicaragua", "NICARAGUA", "Omnilife", "Nicaragua"),
-    Target("Panamá", "PANAMA", "Omnilife", "Panamá"),
-    Target("Paraguay", "PARAGUAY", "Omnilife", "Paraguay"),
-    Target("Perú", "PERU", "Omnilife", "Perú"),
-    Target("República Dominicana", "Republica Dominicana", "Omnilife", "Republica Dominicana", output_filename="Republica Dominicana_servicios de ciberseguridad"),
-    Target("Rusia", "RUSIA", "Omnilife", "Rusia"),
-    Target("Uruguay", "URUGUAY", "Omnilife", "Uruguay"),
-    Target("Arte y Cultura", "Arte y Cultura Omnilife A.C", "Razón Social", "Arte y Cultura (Museo JV)"),
-    Target("Consorcio VAV", "Consorcio Vav, S.A. de C.V", "Razón Social", "Consorcio VAV"),
+    # Países (Tenable: categoría "Paises")
+    Target("Argentina", "ARGENTINA", "Paises", "Argentina"),
+    Target("Bolivia", "BOLIVIA", "Paises", "Bolivia"),
+    Target("Brasil", "BRASIL", "Paises", "Brasil"),
+    Target("Chile", "CHILE", "Paises", "Chile"),
+    Target("Colombia", "COLOMBIA", "Paises", "Colombia"),
+    Target("Colombia Manufactura", "Colombia Manufactura", "Paises", "Colombia Manufactura"),
+    Target("Costa Rica", "COSTA RICA", "Paises", "Costa Rica"),
+    Target("Ecuador", "ECUADOR", "Paises", "Ecuador"),
+    Target("El Salvador", "EL SALVADOR", "Paises", "El Salvador"),
+    Target("España", "ESPAÑA", "Paises", "España"),
+    Target("Estados Unidos", "USA", "Paises", "Estados Unidos"),
+    Target("Guatemala", "GUATEMALA", "Paises", "Guatemala"),
+    Target("Honduras", "Honduras Corporativo", "Paises", "Honduras"),
+    Target("Nicaragua", "NICARAGUA", "Paises", "Nicaragua"),
+    Target("Panamá", "PANAMA", "Paises", "Panamá"),
+    Target("Paraguay", "PARAGUAY", "Paises", "Paraguay"),
+    Target("Perú", "PERU", "Paises", "Perú"),
+    Target("República Dominicana", "Republica Dominicana", "Paises", "República Dominicana", output_filename="Republica Dominicana_servicios de ciberseguridad"),
+    Target("Rusia", "RUSIA", "Paises", "Rusia"),
+    Target("Uruguay", "URUGUAY", "Paises", "Uruguay"),
+
+    # Omnilife de México (Tenable: categoría "Omnilife de Mexico")
+    Target("MX00AD001", "Omnilife de México S.A de C.V.-MX00AD001", "Omnilife de Mexico", "MX00AD001"),
+    Target("MX00AD011", "Omnilife de México S.A de C.V.-MX00AD011", "Omnilife de Mexico", "MX00AD011"),
+    Target("MX00AD012", "Omnilife de México S.A de C.V.-MX00AD012", "Omnilife de Mexico", "MX00AD012"),
+    Target("MX00AD013", "Omnilife de México S.A de C.V.-MX00AD013", "Omnilife de Mexico", "MX00AD013"),
+    Target("MX00AD014", "Omnilife de México S.A de C.V.-MX00AD014", "Omnilife de Mexico", "MX00AD014"),
+    Target("MX00AD015", "Omnilife de México S.A de C.V.-MX00AD015", "Omnilife de Mexico", "MX00AD015"),
+    Target("MX00AD016", "Omnilife de México S.A de C.V.-MX00AD016", "Omnilife de Mexico", "MX00AD016"),
+    Target("MX00AD017", "Omnilife de México S.A de C.V.-MX00AD017", "Omnilife de Mexico", "MX00AD017"),
+    Target("MX00AD018", "Omnilife de México S.A de C.V.-MX00AD018", "Omnilife de Mexico", "MX00AD018"),
+    Target("MX00AD019", "Omnilife de México S.A de C.V.-MX00AD019", "Omnilife de Mexico", "MX00AD019"),
+    Target("MX00AD021", "Omnilife de México S.A de C.V.-MX00AD021", "Omnilife de Mexico", "MX00AD021"),
+    Target("MX00AD024", "Omnilife de México S.A de C.V.-MX00AD024", "Omnilife de Mexico", "MX00AD024"),
+    Target("MX00AD034", "Omnilife de México S.A de C.V.-MX00AD034", "Omnilife de Mexico", "MX00AD034"),
+    Target("MX00AD042", "Omnilife de México S.A de C.V.-MX00AD042", "Omnilife de Mexico", "MX00AD042"),
+    Target("MX00AD043", "Omnilife de México S.A de C.V.-MX00AD043", "Omnilife de Mexico", "MX00AD043"),
+    Target("MX00C0093", "Omnilife de México S.A de C.V.-MX00CO093", "Omnilife de Mexico", "MX00C0093"),
+    Target("MX00C0097", "Omnilife de México S.A de C.V.-MX00CO097", "Omnilife de Mexico", "MX00C0097"),
+    Target("MX00C0122", "Omnilife de México S.A de C.V.-MX00CO122", "Omnilife de Mexico", "MX00C0122"),
+    Target("MX00SE002", "Omnilife de México S.A de C.V.-MX00SE002", "Omnilife de Mexico", "MX00SE002"),
+    Target("Ruta Movil", "Omnilife de México S.A de C.V.-MX00 Rutas Moviles", "Omnilife de Mexico", "Ruta Movil"),
+    Target("Zona Centro", "Omnilife de México S.A de C.V.-MX Zona Centro", "Omnilife de Mexico", "Zona Centro"),
+    Target("Zona Norte", "Omnilife de México S.A de C.V.-MX00 Zona Norte", "Omnilife de Mexico", "Zona Norte"),
+    Target("Zona Occidente", "Omnilife de México S.A de C.V.-MX00 Zona Occidente", "Omnilife de Mexico", "Zona Occidente"),
+    Target("Zona Sur", "Omnilife de México S.A de C.V.-MX00 Zona Sur", "Omnilife de Mexico", "Zona Sur"),
+    # Pendientes por falta de grupo AMP primario confirmado: MX00AD033 y MX00AD052.
+
+    # Razones sociales (Tenable: categoría "Razón Social")
+    Target("Arte y Cultura", "Arte y Cultura Omnilife A.C.", "Razón Social", "Arte y Cultura (Museo JV)"),
+    # AMP relacionados con Chivas de Corazón: MAC-ESTADIO-CHIVAS, SERVIDORES-CHIVAS,
+    # SERVIDORES-LINUX-CHIVAS y CHIVAS-ACCESOS. Se mantiene CHIVAS-ACCESOS como grupo principal.
+    Target(
+        "Chivas de Corazón",
+        "CHIVAS-ACCESOS",
+        "Razón Social",
+        "Chivas de Corazón",
+        amp_related_names=("MAC-ESTADIO-CHIVAS", "SERVIDORES-CHIVAS", "SERVIDORES-LINUX-CHIVAS"),
+    ),
+    Target("Consorcio VAV", "Consorcio Vav, S.A. de C.V.", "Razón Social", "Consorcio VAV"),
     Target("Educare", "Educare", "Razón Social", "Educare"),
-    Target("Fundación Jorge Vergara", "Fundación Jorge vergara, A.C", "Razón Social", "Fundación Jorge Vergara", output_filename="Fundacion Jorge Vergara_servicios de ciberseguridad"),
-    Target("OML Seguros", "OML Agente de Seguros y de Fianzas, S.A. de C.V", "Razón Social", "OML Seguros"),
-    Target("Omnia de Guadalajara", "Omnia de Guadalajara, S.A. de C.V", "Razón Social", "Omnia de Guadalajara"),
+    Target("Fundación Jorge Vergara", "Fundación Jorge vergara, A.C.", "Razón Social", "Fundación Jorge Vergara", output_filename="Fundacion Jorge Vergara_servicios de ciberseguridad"),
+    Target("OML Seguros", "OML Agente de Seguros y de Fianzas, S.A. de C.V.", "Razón Social", "OML Seguros"),
+    Target("Omnia de Guadalajara", "Omnia de Guadalajara, S.A. de C.V.", "Razón Social", "Omnia de Guadalajara"),
     Target("Omnidata Internacional", "Omnidata Internacional", "Razón Social", "Omnidata Internacional"),
-    Target("Omnihumana", "Omnihumana S.A. de C.V", "Razón Social", "Omnihumana"),
-    Target("Omnilife de México", "Omnilife de México S.A de C.V", "Razón Social", "Omnilife de México"),
+    Target("Omnihumana", "Omnihumana  S.A. de C.V.", "Razón Social", "Omnihumana"),
+    Target("Omnilife de México", "Omnilife de México S.A de C.V.", "Razón Social", "Omnilife de México"),
     Target("Omnilife Manufactura", "Omnilife Manufactura", "Razón Social", "Omnilife Manufactura"),
     Target("Omnipromotora", "Omni promotora de Negocios SA", "Razón Social", "Omnipromotora"),
-    Target("Omnisky", "Omnisky SA de CV", "Razón Social", "Omnisky"),
-    Target("Planeta Morado", "Planeta Morado , A.C", "Razón Social", "Planeta Morado"),
-    Target("Seytú", "Seytu Cosmética, S.A. de C.V", "Razón Social", "Seytú", output_filename="Seytu_servicios de ciberseguridad"),
-    Target("Templo Mayor", "Templo Mayor de Chivas, A.C", "Razón Social", "Templo Mayor"),
+    Target("Omnisky", "Omnisky  SA de CV", "Razón Social", "Omnisky"),
+    # Por ahora Operadora Chivas se relaciona con AMP Estadio Omnilife.
+    Target("Operadora Chivas", "Estadio Omnilife", "Razón Social", "Operadora Chivas"),
+    Target("Planeta Morado", "Planeta Morado , A.C.", "Razón Social", "Planeta Morado"),
+    Target("Seytú", "Seytu Cosmética, S.A. de C.V.", "Razón Social", "Seytú", output_filename="Seytu_servicios de ciberseguridad"),
+    Target("Templo Mayor", "Templo Mayor de Chivas, A.C.", "Razón Social", "Templo Mayor"),
     Target("Transur", "Transur, S.A. de C.V", "Razón Social", "Transur"),
 )
 
@@ -360,14 +404,20 @@ def list_tenable_tag_dirs(tenable_root: Path) -> Dict[Tuple[str, str], Path]:
 
 
 def resolve_amp_dir(target: Target, amp_dirs: Dict[str, Path]) -> Optional[Path]:
-    wanted = norm(target.amp_name)
-    exact = amp_dirs.get(wanted)
-    if exact:
-        return exact
-    for k, v in amp_dirs.items():
-        if wanted in k or k in wanted:
-            print(f"[WARN][AMP] Match no exacto para '{target.amp_name}': usando grupo '{k}' -> {v}")
-            return v
+    wanted_names = [target.amp_name, *target.amp_related_names]
+    for wanted_name in wanted_names:
+        wanted = norm(wanted_name)
+        exact = amp_dirs.get(wanted)
+        if exact:
+            if wanted_name != target.amp_name:
+                print(f"[WARN][AMP] Grupo principal '{target.amp_name}' no encontrado para '{target.display_name}'; usando relacionado '{wanted_name}' -> {exact}")
+            return exact
+    for wanted_name in wanted_names:
+        wanted = norm(wanted_name)
+        for k, v in amp_dirs.items():
+            if wanted in k or k in wanted:
+                print(f"[WARN][AMP] Match no exacto para '{wanted_name}': usando grupo '{k}' -> {v}")
+                return v
     return None
 
 
@@ -681,7 +731,13 @@ def filter_targets(targets: Sequence[Target], only: Optional[Sequence[str]]) -> 
     wanted = {norm(x) for x in only}
     out: List[Target] = []
     for t in targets:
-        names = {norm(t.display_name), norm(t.amp_name), norm(t.tenable_value), norm(t.output_filename or "")}
+        names = {
+            norm(t.display_name),
+            norm(t.amp_name),
+            norm(t.tenable_value),
+            norm(t.output_filename or ""),
+            *(norm(name) for name in t.amp_related_names),
+        }
         if names & wanted:
             out.append(t)
     return out
@@ -689,6 +745,8 @@ def filter_targets(targets: Sequence[Target], only: Optional[Sequence[str]]) -> 
 
 def build_allowed_target_sets(selected_targets: Sequence[Target]) -> tuple[set[str], set[tuple[str, str]]]:
     allowed_amp = {norm(t.amp_name) for t in selected_targets}
+    for target in selected_targets:
+        allowed_amp.update(norm(name) for name in target.amp_related_names)
     allowed_tenable = {(norm(t.tenable_category), norm(t.tenable_value)) for t in selected_targets}
     return allowed_amp, allowed_tenable
 
