@@ -518,31 +518,36 @@ def replace_docx_images(template_path: Path, output_path: Path, replacements: Di
     return missing_slots
 
 
-def replace_text_in_docx(
-    docx_path: Path,
-    old_entity: str,
-    new_entity: str,
-    old_period: Optional[str],
-    new_period: Optional[str],
-) -> dict[str, int]:
-    try:
-        from docx import Document  # type: ignore
-    except Exception as exc:
-        raise RuntimeError("python-docx no está disponible para reemplazar texto.") from exc
-
-    rules: List[Tuple[str, str, str]] = []
-    if old_entity and new_entity and old_entity != new_entity:
-        rules.append((old_entity, new_entity, "entity"))
-    if old_period and new_period and old_period != new_period:
-        rules.append((old_period, new_period, "period"))
-
-    stats = {
+def _replace_text_stats() -> dict[str, int | str]:
+    return {
         "paragraphs_scanned": 0,
         "paragraphs_changed": 0,
         "entity_replacements": 0,
         "period_replacements": 0,
         "cross_run_skipped": 0,
+        "engine": "",
     }
+
+
+def _build_text_replacement_rules(
+    old_entity: str,
+    new_entity: str,
+    old_period: Optional[str],
+    new_period: Optional[str],
+) -> List[Tuple[str, str, str]]:
+    rules: List[Tuple[str, str, str]] = []
+    if old_entity and new_entity and old_entity != new_entity:
+        rules.append((old_entity, new_entity, "entity"))
+    if old_period and new_period and old_period != new_period:
+        rules.append((old_period, new_period, "period"))
+    return rules
+
+
+def _replace_text_with_python_docx(docx_path: Path, rules: Sequence[Tuple[str, str, str]]) -> dict[str, int | str]:
+    from docx import Document  # type: ignore
+
+    stats = _replace_text_stats()
+    stats["engine"] = "python-docx"
 
     def _replace_in_single_runs(paragraph) -> int:
         local_changes = 0
@@ -601,7 +606,6 @@ def replace_text_in_docx(
                 first_i = involved[0]
                 last_i = involved[-1]
 
-                # Hallar offsets exactos dentro de runs extremos
                 pos = 0
                 start_offset = 0
                 end_offset = 0
@@ -626,12 +630,11 @@ def replace_text_in_docx(
                     paragraph.runs[i].text = ""
 
                 full_text = full_text[:idx] + new + full_text[end:]
-                repl_count = 1
                 if label == "entity":
-                    stats["entity_replacements"] += repl_count
+                    stats["entity_replacements"] += 1
                 else:
-                    stats["period_replacements"] += repl_count
-                total += repl_count
+                    stats["period_replacements"] += 1
+                total += 1
                 search_from = idx + len(new)
         return total
 
@@ -673,6 +676,168 @@ def replace_text_in_docx(
     return stats
 
 
+def _replace_text_with_zip_xml(docx_path: Path, rules: Sequence[Tuple[str, str, str]]) -> dict[str, int | str]:
+    import xml.etree.ElementTree as ET
+
+    namespaces = {
+        "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "pic": "http://schemas.openxmlformats.org/drawingml/2006/picture",
+    }
+    for prefix, uri in namespaces.items():
+        ET.register_namespace(prefix, uri)
+
+    w_ns = namespaces["w"]
+    text_tag = f"{{{w_ns}}}t"
+    paragraph_tag = f"{{{w_ns}}}p"
+    xml_parts_pattern = re.compile(r"^word/(?:document|header\d+|footer\d+)\.xml$")
+    stats = _replace_text_stats()
+    stats["engine"] = "zip-xml"
+
+    def _replace_in_single_text_nodes(text_nodes: Sequence[ET.Element]) -> int:
+        local_changes = 0
+        for node in text_nodes:
+            text = node.text or ""
+            if not text:
+                continue
+            updated = text
+            for old, new, label in rules:
+                cnt = updated.count(old)
+                if cnt:
+                    updated = updated.replace(old, new)
+                    if label == "entity":
+                        stats["entity_replacements"] += cnt
+                    else:
+                        stats["period_replacements"] += cnt
+                    local_changes += cnt
+            if updated != text:
+                node.text = updated
+        return local_changes
+
+    def _replace_cross_node_conservative(text_nodes: Sequence[ET.Element]) -> int:
+        if not text_nodes or not rules:
+            return 0
+        full_text = "".join(node.text or "" for node in text_nodes)
+        if not full_text:
+            return 0
+
+        total = 0
+        for old, new, label in rules:
+            search_from = 0
+            while True:
+                idx = full_text.find(old, search_from)
+                if idx < 0:
+                    break
+                end = idx + len(old)
+
+                involved: List[int] = []
+                pos = 0
+                for i, node in enumerate(text_nodes):
+                    node_text = node.text or ""
+                    node_end = pos + len(node_text)
+                    if node_text and idx < node_end and end > pos:
+                        involved.append(i)
+                    pos = node_end
+
+                if len(involved) <= 1:
+                    search_from = end
+                    continue
+
+                if any(not (text_nodes[i].text or "").strip() for i in involved):
+                    stats["cross_run_skipped"] += 1
+                    search_from = end
+                    continue
+
+                first_i = involved[0]
+                last_i = involved[-1]
+                pos = 0
+                start_offset = 0
+                end_offset = 0
+                for i, node in enumerate(text_nodes):
+                    node_text = node.text or ""
+                    node_end = pos + len(node_text)
+                    if i == first_i:
+                        start_offset = idx - pos
+                    if i == last_i:
+                        end_offset = end - pos
+                        break
+                    pos = node_end
+
+                first_text = text_nodes[first_i].text or ""
+                last_text = text_nodes[last_i].text or ""
+                prefix = first_text[:start_offset]
+                suffix = last_text[end_offset:]
+
+                text_nodes[first_i].text = prefix + new + suffix
+                for i in involved[1:]:
+                    text_nodes[i].text = ""
+
+                full_text = full_text[:idx] + new + full_text[end:]
+                if label == "entity":
+                    stats["entity_replacements"] += 1
+                else:
+                    stats["period_replacements"] += 1
+                total += 1
+                search_from = idx + len(new)
+        return total
+
+    def _process_xml_part(data: bytes) -> Tuple[bytes, bool]:
+        root = ET.fromstring(data)
+        changed = False
+        for paragraph in root.iter(paragraph_tag):
+            stats["paragraphs_scanned"] += 1
+            text_nodes = list(paragraph.iter(text_tag))
+            single_changes = _replace_in_single_text_nodes(text_nodes)
+            cross_changes = _replace_cross_node_conservative(text_nodes)
+            if single_changes or cross_changes:
+                stats["paragraphs_changed"] += 1
+                changed = True
+        if not changed:
+            return data, False
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True), True
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp_file:
+        tmp_path = Path(tmp_file.name)
+
+    try:
+        with zipfile.ZipFile(docx_path, "r") as zin, zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if xml_parts_pattern.match(item.filename):
+                    data, _ = _process_xml_part(data)
+                zout.writestr(item, data)
+        tmp_path.replace(docx_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+    return stats
+
+
+def replace_text_in_docx(
+    docx_path: Path,
+    old_entity: str,
+    new_entity: str,
+    old_period: Optional[str],
+    new_period: Optional[str],
+) -> dict[str, int | str]:
+    rules = _build_text_replacement_rules(old_entity, new_entity, old_period, new_period)
+    if not rules:
+        stats = _replace_text_stats()
+        stats["engine"] = "sin-reglas"
+        return stats
+
+    try:
+        return _replace_text_with_python_docx(docx_path, rules)
+    except ModuleNotFoundError as exc:
+        if exc.name != "docx":
+            raise
+        print("[WARN][DOCX] python-docx no está instalado; usando reemplazo XML interno sin dependencia externa.")
+        return _replace_text_with_zip_xml(docx_path, rules)
+
+
 def build_report_for_target(
     target: Target,
     template_path: Path,
@@ -710,7 +875,7 @@ def build_report_for_target(
             REPORT_PERIOD_DOCX or None,
         )
         print(
-            "[DEBUG][DOCX] Reemplazo python-docx "
+            f"[DEBUG][DOCX] Reemplazo {text_stats['engine']} "
             f"(target={target.display_name}) -> parrafos_revisados={text_stats['paragraphs_scanned']}, "
             f"parrafos_modificados={text_stats['paragraphs_changed']}, "
             f"entidad_reemplazos={text_stats['entity_replacements']}, "
@@ -721,7 +886,7 @@ def build_report_for_target(
             print(f"[DEBUG][DOCX] Entidad reemplazada correctamente para '{target.display_name}'.")
         if text_stats["period_replacements"] > 0:
             print(f"[DEBUG][DOCX] Fecha reemplazada correctamente para '{target.display_name}': '{REPORT_PERIOD_DOCX}'.")
-        print("[DEBUG][DOCX] Confirmación: se usó python-docx de forma conservadora para texto.")
+        print(f"[DEBUG][DOCX] Confirmación: se usó {text_stats['engine']} de forma conservadora para texto.")
     return out_file, warnings
 
 
