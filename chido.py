@@ -173,6 +173,12 @@ def format_period_for_docx(report_period: str, *, manual_month_year: bool) -> st
     return "Últimos 30 días"
 
 
+def amp_last_30_days_range() -> Tuple[datetime, datetime]:
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=30)
+    return start, end
+
+
 def cover_entity_name(target: Target) -> str:
     name = (target.display_name or target.output_filename or target.tenable_value or target.amp_name or "").strip()
     name = re.sub(r"\s*\([^)]*\)", "", name)
@@ -1200,8 +1206,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("[INFO] Generando imágenes de AMP...")
         amp_root: Optional[Path] = None
         amp_generation_failed = False
+        amp_start_utc, amp_end_utc = amp_last_30_days_range()
+        print(
+            "[INFO][AMP] Usando siempre últimos 30 días para eventos AMP: "
+            f"{amp_start_utc.isoformat()} -> {amp_end_utc.isoformat()}"
+        )
         try:
-            amp_root = run_amp_unified(amp_workdir, start_utc, end_utc, allowed_amp=allowed_amp)
+            amp_root = run_amp_unified(amp_workdir, amp_start_utc, amp_end_utc, allowed_amp=allowed_amp)
         except Exception as e:
             amp_generation_failed = True
             if _is_amp_connectivity_failure(e):
