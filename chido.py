@@ -950,6 +950,15 @@ def build_report_for_target(
         amp_generation_failed=amp_generation_failed,
         tenable_generation_failed=tenable_generation_failed,
     )
+    amp_replacements = [
+        slot for slot, (source, _) in DOCX_IMAGE_MAP.items()
+        if source == "amp" and slot in replacements
+    ]
+    print(
+        f"[DEBUG][DOCX][AMP] {target.display_name}: "
+        f"imagenes_amp_reemplazadas={len(amp_replacements)}/3 "
+        f"carpeta_amp={amp_dir if amp_dir else 'NO_MATCH'}"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     out_file = output_dir / output_filename_for(target)
     missing_slots = replace_docx_images(template_path, out_file, replacements)
@@ -1512,23 +1521,44 @@ class AmpClient:
         raise AmpConnectivityError(f"[AMP] {context} agotó reintentos por conectividad.") from last_exc
 
     def get_groups(self) -> List[Dict[str, str]]:
-        r = self._get_with_retry(
-            "groups",
-            params={"limit": 500},
-            timeout=60,
-            context="get_groups",
-            max_attempts=6,
-            base_delay=3.0,
-        )
-        if r.status_code >= 300:
-            raise RuntimeError(f"GET {r.url} failed: {r.status_code} {r.text[:400]}")
-        data = r.json().get("data") or []
         out: List[Dict[str, str]] = []
-        for g in data:
-            name = str(g.get("name") or "Unknown")
-            guid = str(g.get("guid") or g.get("group_guid") or "")
-            if guid:
-                out.append({"name": name, "guid": guid})
+        seen: set[str] = set()
+        limit = 500
+        offset = 0
+
+        while True:
+            r = self._get_with_retry(
+                "groups",
+                params={"limit": limit, "offset": offset},
+                timeout=60,
+                context=f"get_groups offset={offset}",
+                max_attempts=6,
+                base_delay=3.0,
+            )
+            if r.status_code >= 300:
+                raise RuntimeError(f"GET {r.url} failed: {r.status_code} {r.text[:400]}")
+
+            data = r.json().get("data") or []
+            if not isinstance(data, list):
+                data = []
+
+            before = len(out)
+            for g in data:
+                if not isinstance(g, dict):
+                    continue
+                name = str(g.get("name") or g.get("group_name") or "Unknown")
+                guid = str(g.get("guid") or g.get("group_guid") or g.get("id") or "")
+                key = guid or _amp_norm_name(name)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                if guid:
+                    out.append({"name": name, "guid": guid})
+
+            if len(data) < limit or len(out) == before:
+                break
+            offset += limit
+
         return out
 
     # ----------- Events method (Compromises) -----------
@@ -2613,6 +2643,9 @@ def amp_main():
         before = len(groups)
         groups = _filter_existing_amp_groups(groups, allowed_amp)
         print(f"✅ Groups filtrados por TARGETS existentes: {len(groups)} de {before}")
+        if before > 0 and not groups:
+            preview = sorted(_amp_norm_name(x) for x in allowed_amp if x)[:20]
+            print(f"[WARN][AMP] El filtro de TARGETS no coincidio con ningun grupo AMP. Targets esperados: {preview}")
     print(f"✅ Groups detectados: {len(groups)}")
     print(f"✅ Rango UTC (events): start={iso_utc_compromises(start_utc)} | end={iso_utc_compromises(end_utc)}")
 
