@@ -1082,10 +1082,15 @@ def _interactive_select(title: str, options: List[str]) -> str:
             return options[idx]
 
 
-def choose_template_interactive(base_dir: Path) -> Path:
-    docx_files = sorted([p.name for p in base_dir.iterdir() if p.is_file() and p.suffix.lower() == ".docx"])
+def choose_template_interactive(base_dir: Path) -> Optional[Path]:
+    docx_files = sorted([
+        p.name
+        for p in base_dir.iterdir()
+        if p.is_file() and p.suffix.lower() == ".docx" and not p.name.startswith("~$")
+    ])
     if not docx_files:
-        raise RuntimeError("No se encontraron plantillas .docx en el directorio base.")
+        print("[ERR] No hay plantillas DOCX disponibles en la carpeta del proyecto.")
+        return None
     selected = _interactive_select("Selecciona plantilla DOCX", docx_files)
     return base_dir / selected
 
@@ -1152,6 +1157,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         REPORT_PERIOD_DOCX = format_period_for_docx(REPORT_PERIOD, manual_month_year=True)
     else:
         template_docx = choose_template_interactive(BASE_DIR)
+        if template_docx is None:
+            return 2
         start_utc, end_utc, REPORT_PERIOD, month_folder, manual_month_year = choose_period_interactive()
         REPORT_PERIOD_DOCX = format_period_for_docx(month_folder, manual_month_year=manual_month_year)
         if not args.solo:
@@ -1640,12 +1647,12 @@ class AmpClient:
                 if r.status_code == 429:
                     wait_s = parse_wait_seconds_from_429_compromises(r)
                     wait_s = min(180, wait_s + (attempt - 1) * 3)
-                    print(f"⚠️ 429 Rate limit. Esperando {wait_s}s... ({attempt}/{max_retries})")
+                    print(f"[WARN][AMP] 429 Rate limit. Esperando {wait_s}s... ({attempt}/{max_retries})")
                     time.sleep(wait_s)
                     continue
 
                 if r.status_code >= 500:
-                    print(f"⚠️ HTTP {r.status_code}. Backoff {backoff_5xx}s... ({attempt}/{max_retries})")
+                    print(f"[WARN][AMP] HTTP {r.status_code}. Backoff {backoff_5xx}s... ({attempt}/{max_retries})")
                     time.sleep(backoff_5xx)
                     backoff_5xx = min(60, backoff_5xx * 2)
                     continue
@@ -2684,6 +2691,11 @@ def amp_main():
                 base_sleep=4.0,
             )
             compromise_events = filter_compromise_events(events_in_range)
+            if not compromise_events:
+                if events_in_range:
+                    print(f"[INFO][AMP] {gname}: eventos en rango={len(events_in_range)}, compromises_filtrados=0")
+                else:
+                    print(f"[INFO][AMP] {gname}: sin eventos AMP de compromises en el rango seleccionado")
 
             out_img_comp = os.path.join(out_dir, "compromises.png")
             render_compromises_card(compromise_events, out_img_comp)
@@ -2702,6 +2714,11 @@ def amp_main():
                 base_sleep=4.0,
             )
             threats = build_unique_threats_by_detection_id(events_thr)
+            if not threats:
+                if events_thr:
+                    print(f"[INFO][AMP] {gname}: eventos threat en rango={len(events_thr)}, threats_unicas=0")
+                else:
+                    print(f"[INFO][AMP] {gname}: sin eventos AMP de threats en el rango seleccionado")
 
             out_img_thr = os.path.join(out_dir, "threats.png")
             render_threats_card(threats, out_img_thr)
