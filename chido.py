@@ -25,6 +25,7 @@ CURRENT_MONTH_FOLDER = datetime.now().strftime("%Y-%m")
 OUTPUT_DIR = BASE_OUTPUT_DIR / CURRENT_MONTH_FOLDER
 
 AMP_ALLOWED_GROUPS_OVERRIDE: Optional[set[str]] = None
+AMP_DEVICE_GROUP_ALIASES_OVERRIDE: Optional[Dict[str, Tuple[str, ...]]] = None
 TENABLE_ALLOWED_TARGETS_OVERRIDE: Optional[set[tuple[str, str]]] = None
 
 TEMPLATE_ENTITY_NAME = "Argentina"
@@ -258,10 +259,17 @@ def _is_tenable_connectivity_failure(exc: BaseException) -> bool:
     return False
 
 
-def run_amp_unified(workdir: Path, start_utc: datetime, end_utc: datetime, allowed_amp: Optional[set[str]] = None) -> Path:
-    global AMP_START_UTC_OVERRIDE, AMP_END_UTC_OVERRIDE, OUTPUT_ROOT, AMP_ALLOWED_GROUPS_OVERRIDE
+def run_amp_unified(
+    workdir: Path,
+    start_utc: datetime,
+    end_utc: datetime,
+    allowed_amp: Optional[set[str]] = None,
+    device_group_aliases: Optional[Dict[str, Tuple[str, ...]]] = None,
+) -> Path:
+    global AMP_START_UTC_OVERRIDE, AMP_END_UTC_OVERRIDE, OUTPUT_ROOT, AMP_ALLOWED_GROUPS_OVERRIDE, AMP_DEVICE_GROUP_ALIASES_OVERRIDE
     old_cwd = Path.cwd()
     old_allowed = AMP_ALLOWED_GROUPS_OVERRIDE
+    old_device_aliases = AMP_DEVICE_GROUP_ALIASES_OVERRIDE
     max_attempts = 3
     base_wait = 10
     try:
@@ -269,6 +277,7 @@ def run_amp_unified(workdir: Path, start_utc: datetime, end_utc: datetime, allow
         AMP_START_UTC_OVERRIDE = start_utc
         AMP_END_UTC_OVERRIDE = end_utc
         AMP_ALLOWED_GROUPS_OVERRIDE = set(allowed_amp) if allowed_amp is not None else None
+        AMP_DEVICE_GROUP_ALIASES_OVERRIDE = dict(device_group_aliases) if device_group_aliases is not None else None
         OUTPUT_ROOT = os.path.join(os.getcwd(), "amp_reportes_unificado")
         print(f"[DEBUG][AMP] OUTPUT_ROOT configurado en: {OUTPUT_ROOT}")
         recovered = False
@@ -300,6 +309,7 @@ def run_amp_unified(workdir: Path, start_utc: datetime, end_utc: datetime, allow
         AMP_START_UTC_OVERRIDE = None
         AMP_END_UTC_OVERRIDE = None
         AMP_ALLOWED_GROUPS_OVERRIDE = old_allowed
+        AMP_DEVICE_GROUP_ALIASES_OVERRIDE = old_device_aliases
         os.chdir(old_cwd)
     amp_root = workdir / "amp_reportes_unificado"
     require_exists(amp_root, "salida AMP")
@@ -1024,6 +1034,17 @@ def build_allowed_target_sets(selected_targets: Sequence[Target]) -> tuple[set[s
     return allowed_amp, allowed_tenable
 
 
+def build_device_group_aliases(selected_targets: Sequence[Target]) -> Dict[str, Tuple[str, ...]]:
+    """Grupos AMP relacionados que deben sumarse al calcular Devices de un target
+    (ej. Chivas de Corazón reparte sus endpoints reales en grupos "hermanos" en vez
+    del grupo principal). Se indexa por amp_name normalizado."""
+    aliases: Dict[str, Tuple[str, ...]] = {}
+    for t in selected_targets:
+        if t.amp_related_names:
+            aliases[norm(t.amp_name)] = t.amp_related_names
+    return aliases
+
+
 def dedupe_keep_order(items: List[str]) -> List[str]:
     seen = set()
     out = []
@@ -1179,6 +1200,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     allowed_amp, allowed_tenable = build_allowed_target_sets(selected_targets)
+    device_group_aliases = build_device_group_aliases(selected_targets)
 
     require_exists(template_docx, "TEMPLATE_DOCX")
     template_media = inspect_template_media(template_docx)
@@ -1212,7 +1234,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"{amp_start_utc.isoformat()} -> {amp_end_utc.isoformat()}"
         )
         try:
-            amp_root = run_amp_unified(amp_workdir, amp_start_utc, amp_end_utc, allowed_amp=allowed_amp)
+            amp_root = run_amp_unified(
+                amp_workdir,
+                amp_start_utc,
+                amp_end_utc,
+                allowed_amp=allowed_amp,
+                device_group_aliases=device_group_aliases,
+            )
         except Exception as e:
             amp_generation_failed = True
             if _is_amp_connectivity_failure(e):
@@ -1893,8 +1921,10 @@ COMPROMISE_EVENT_TYPES = {
     "Quarantine Failed",
     "Threat Not Quarantined",
     "Pcalua Launched Suspicious Process",
-    "Scan Completed With Detection",
+    "Scan Completed With Detections",
     "AnyDesk Suspicious File Creation",
+    "Retrospective Detection",
+    "Cloud IOC",
 }
 
 C_CARD_W, C_CARD_H = 1920, 1440
@@ -2035,6 +2065,7 @@ EVENT_ID_THREAT_QUARANTINED = 553648143
 EVENT_ID_QUARANTINE_FAILURE = 2164260880
 EVENT_ID_CLOUD_RECALL_DETECTION = 553648147
 EVENT_ID_CLOUD_RECALL_QUARANTINE_SUCCESS = 553648155
+EVENT_ID_RETRO_QUARANTINE_ATTEMPT_FAILED = 2164260893
 
 THREATS_RELEVANT_EVENT_TYPE_IDS = {
     EVENT_ID_THREAT_DETECTED,
@@ -2042,6 +2073,7 @@ THREATS_RELEVANT_EVENT_TYPE_IDS = {
     EVENT_ID_QUARANTINE_FAILURE,
     EVENT_ID_CLOUD_RECALL_DETECTION,
     EVENT_ID_CLOUD_RECALL_QUARANTINE_SUCCESS,
+    EVENT_ID_RETRO_QUARANTINE_ATTEMPT_FAILED,
 }
 
 T_CARD_W, T_CARD_H = 1920, 1460
@@ -2226,7 +2258,7 @@ def t_extract_threat_name(ev: dict) -> Optional[str]:
     return None
 
 def t_classify_resolution_from_event_type_ids(type_ids: List[int]) -> Optional[str]:
-    if EVENT_ID_QUARANTINE_FAILURE in type_ids:
+    if EVENT_ID_QUARANTINE_FAILURE in type_ids or EVENT_ID_RETRO_QUARANTINE_ATTEMPT_FAILED in type_ids:
         return "Quarantine Failed"
     if EVENT_ID_THREAT_QUARANTINED in type_ids or EVENT_ID_CLOUD_RECALL_QUARANTINE_SUCCESS in type_ids:
         return "Quarantined"
@@ -2327,6 +2359,15 @@ def t_draw_hbar(d: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int, val: int
 def render_threats_card(unique_threats: List[dict], outpath: str):
     img, d = t_draw_card_base("Threats")
 
+    y0 = 210
+
+    if not unique_threats:
+        # Sin datos: evitar dibujar la dona/barras/etiquetas en "0" (quedaban superpuestas
+        # con este mensaje y era confuso ver "0 Quarantined", "No Data", etc. a la vez).
+        d.text((T_MARGIN, y0 + 40), "No data in last 30 days", fill=T_COL_GRAY, font=T_FONT_H2)
+        img.save(outpath, "PNG")
+        return
+
     files = [t["file_name"] for t in unique_threats]
     hosts = [t["host"] for t in unique_threats]
     threat_names = [t["threat_name"] for t in unique_threats]
@@ -2344,8 +2385,6 @@ def render_threats_card(unique_threats: List[dict], outpath: str):
     top_host_name, top_host_count = (top_host[0] if top_host else ("No data", 0))
 
     top_th = t_top_counts(threat_names, 2)
-
-    y0 = 210
 
     t_section_title(d, T_MARGIN, y0, "Root Cause")
     donut_cx = T_MARGIN + 220
@@ -2386,9 +2425,6 @@ def render_threats_card(unique_threats: List[dict], outpath: str):
             d.text((T_CARD_W - 110, yy - 10), str(val), fill=T_COL_TEXT, font=T_FONT_BODY)
     else:
         d.text((T_MARGIN, y_th - 8), "No threat-name data", fill=T_COL_GRAY, font=T_FONT_BODY)
-
-    if not unique_threats:
-        d.text((T_MARGIN, y0 + 130), "No data in last 30 days", fill=T_COL_GRAY, font=T_FONT_BODY)
 
     img.save(outpath, "PNG")
 
@@ -2460,6 +2496,15 @@ def d_parse_os_bucket(operating_system: Any) -> str:
 
     return s.split(",")[0].strip() or "Unknown OS"
 
+def d_os_family(bucket: str) -> str:
+    """Colapsa buckets especificos (Windows 10/11/Server 2019/2022) en una sola familia,
+    para poder calcular Version Deployment sobre la familia de OS dominante real del
+    grupo (Windows, macOS o Linux) en vez de asumir siempre Windows."""
+    b = (bucket or "").strip()
+    if b.lower().startswith("windows"):
+        return "Windows"
+    return b or "Unknown OS"
+
 def d_count_top(items: List[str]) -> List[Tuple[str, int]]:
     d_: Dict[str, int] = {}
     for x in items:
@@ -2523,15 +2568,119 @@ def build_group_membership_index(computers: List[Dict[str, Any]]) -> Dict[str, L
 
     return idx
 
-def compute_supported_unsupported_baseline(windows_eps: List[Dict[str, Any]]) -> Tuple[int, int, str]:
-    versions = [d_norm(c.get("connector_version")) for c in windows_eps if d_norm(c.get("connector_version"))]
+
+def _find_group_guid_by_norm_name(groups: List[Dict[str, str]], wanted_norm: str) -> Optional[str]:
+    for g in groups:
+        if _amp_norm_name(g.get("name") or "") == wanted_norm:
+            return g.get("guid")
+    return None
+
+
+# Palabras que Cisco usa para nombrar el subgrupo de politica de bloqueo de USB,
+# en cualquier orden ("X - USB BLOCK", "X-BLOCK USB") y con variantes/typos vistos en el
+# tenant ("Bloack" en vez de "Block").
+_DEVICE_POLICY_TOKENS = {"usb", "block", "blocked", "bloqueo", "bloqueado", "bloack"}
+
+# Formas normalizadas (sin puntuacion) del sufijo de razon social, para poder comparar
+# "Seytu Cosmetica, S.A. de C.V." con el subgrupo "Seytu Cosmetica SA de CV-Block USB"
+# aunque cada uno abrevie el sufijo legal de forma distinta.
+_LEGAL_SUFFIX_TOKEN_VARIANTS: Tuple[Tuple[str, ...], ...] = (
+    ("s", "a", "de", "c", "v"),
+    ("sa", "de", "c", "v"),
+    ("s", "a", "de", "cv"),
+    ("sa", "de", "cv"),
+    ("s", "a"),
+    ("sa",),
+    ("a", "c"),
+)
+
+
+def _device_group_core_tokens(name_norm: str) -> Tuple[str, ...]:
+    tokens = [t for t in name_norm.split() if t not in _DEVICE_POLICY_TOKENS]
+    for suf in sorted(_LEGAL_SUFFIX_TOKEN_VARIANTS, key=len, reverse=True):
+        n = len(suf)
+        if len(tokens) > n and tuple(tokens[-n:]) == suf:
+            tokens = tokens[:-n]
+            break
+    return tuple(tokens)
+
+
+def resolve_related_group_guids(
+    gname: str,
+    gguid: str,
+    groups: List[Dict[str, str]],
+    related_group_aliases: Dict[str, Tuple[str, ...]],
+) -> set:
+    """Encuentra todos los guids de grupos AMP "hermanos" del grupo principal: subgrupos de
+    politica USB BLOCK que en Cisco quedaron separados (con nombre, orden de palabras y
+    sufijo de razon social inconsistentes entre si), o grupos declarados explicitamente
+    como amp_related_names. Se usa tanto para Devices como para Compromises/Threats, ya que
+    los endpoints reales de un target pueden estar repartidos en varios grupos de Cisco."""
+    gname_norm = _amp_norm_name(gname)
+    guids = {gguid}
+
+    for related in related_group_aliases.get(gname_norm, ()):
+        related_guid = _find_group_guid_by_norm_name(groups, _amp_norm_name(related))
+        if related_guid:
+            guids.add(related_guid)
+
+    target_core = _device_group_core_tokens(gname_norm)
+    if target_core:
+        for g in groups:
+            g_norm = _amp_norm_name(g.get("name") or "")
+            if g_norm == gname_norm:
+                continue
+            if _device_group_core_tokens(g_norm) == target_core:
+                guids.add(g.get("guid"))
+
+    return guids
+
+
+def resolve_merged_device_endpoints(
+    gname: str,
+    gguid: str,
+    groups: List[Dict[str, str]],
+    membership_idx: Dict[str, List[Dict[str, Any]]],
+    device_group_aliases: Dict[str, Tuple[str, ...]],
+) -> List[Dict[str, Any]]:
+    """Combina los endpoints del grupo principal con los de sus grupos AMP "hermanos"
+    (ver resolve_related_group_guids)."""
+    guids = resolve_related_group_guids(gname, gguid, groups, device_group_aliases)
+
+    endpoints: List[Dict[str, Any]] = []
+    seen_connector: set = set()
+    for guid in guids:
+        for c in membership_idx.get(guid, []):
+            key = d_norm(c.get("connector_guid")) or json.dumps(c, sort_keys=True, ensure_ascii=False)
+            if key in seen_connector:
+                continue
+            seen_connector.add(key)
+            endpoints.append(c)
+    return endpoints
+
+
+def _dedupe_events_by_id(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set = set()
+    out: List[Dict[str, Any]] = []
+    for ev in events:
+        eid = ev.get("id")
+        key = str(eid) if eid is not None else json.dumps(ev, sort_keys=True, ensure_ascii=False)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ev)
+    return out
+
+
+def compute_supported_unsupported_baseline(family_eps: List[Dict[str, Any]]) -> Tuple[int, int, str]:
+    versions = [d_norm(c.get("connector_version")) for c in family_eps if d_norm(c.get("connector_version"))]
     if not versions:
         return (0, 0, "no_connector_version")
     counts = d_count_top(versions)
     baseline = counts[0][0]
     sup = 0
     uns = 0
-    for c in windows_eps:
+    for c in family_eps:
         v = d_norm(c.get("connector_version"))
         if not v:
             continue
@@ -2561,6 +2710,27 @@ def d_draw_donut(d: ImageDraw.ImageDraw, cx: int, cy: int, outer_r: int, inner_r
     d.ellipse([cx - outer_r, cy - outer_r, cx + outer_r, cy + outer_r], fill=color)
     d.ellipse([cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r], fill=D_COL_BG)
 
+D_OS_PALETTE = (D_COL_PURPLE, D_COL_BLUE, D_COL_YELLOW, D_COL_GRAY)
+
+def d_draw_multi_donut(d: ImageDraw.ImageDraw, cx: int, cy: int, outer_r: int, inner_r: int, values: List[int]):
+    """Dona real: un sector proporcional por cada valor de `values` (mismo orden/colores
+    que las filas de texto de 'By Host'), en vez de un solo circulo decorativo."""
+    total = sum(v for v in values if v > 0)
+    if total <= 0:
+        d.ellipse([cx - outer_r, cy - outer_r, cx + outer_r, cy + outer_r], fill=D_COL_BORDER)
+        d.ellipse([cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r], fill=D_COL_BG)
+        return
+    bbox = [cx - outer_r, cy - outer_r, cx + outer_r, cy + outer_r]
+    start_angle = -90.0
+    for i, v in enumerate(values):
+        if v <= 0:
+            continue
+        sweep = 360.0 * (v / total)
+        end_angle = start_angle + max(sweep, 0.5)
+        d.pieslice(bbox, start_angle, end_angle, fill=D_OS_PALETTE[i % len(D_OS_PALETTE)])
+        start_angle = end_angle
+    d.ellipse([cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r], fill=D_COL_BG)
+
 def d_draw_version_bar(d: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int, supported: int, unsupported: int):
     total = max(1, supported + unsupported)
     w_sup = int(w * (supported / total))
@@ -2570,7 +2740,44 @@ def d_draw_version_bar(d: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int, s
     if w_uns > 0:
         d.rectangle([x + w_sup, y, x + w_sup + w_uns, y + h], fill=D_COL_YELLOW)
 
-def render_devices_card(top_os: str, supported: int, unsupported: int, outpath: str, empty_note: bool):
+def _condense_breakdown_with_other(rows: List[Tuple[str, int]], limit: int) -> List[Tuple[str, int]]:
+    """Si hay mas categorias que `limit`, agrupa el resto en una fila 'Otros' en vez de
+    descartarlas en silencio -- la suma de lo mostrado siempre debe dar el total real."""
+    if len(rows) <= limit:
+        return rows
+    head = rows[: limit - 1]
+    rest_total = sum(c for _, c in rows[limit - 1 :])
+    return head + [("Otros", rest_total)]
+
+
+def _condense_family_deployment_with_other(
+    rows: List[Tuple[str, int, int]], limit: int
+) -> List[Tuple[str, int, int]]:
+    if len(rows) <= limit:
+        return rows
+    head = rows[: limit - 1]
+    rest_sup = sum(s for _, s, _ in rows[limit - 1 :])
+    rest_uns = sum(u for _, _, u in rows[limit - 1 :])
+    return head + [("Otras familias", rest_sup, rest_uns)]
+
+
+def render_devices_card(
+    top_os_breakdown: List[Tuple[str, int]],
+    family_deployment: List[Tuple[str, int, int]],
+    outpath: str,
+    empty_note: bool,
+):
+    """top_os_breakdown: lista (bucket especifico, count) ya ordenada de mayor a menor
+    (ej. [("Windows 11", 37), ("macOS", 21), ("Windows 10", 13)]) -- se muestran hasta 4
+    filas reales con su propio color (agrupando el resto en "Otros" si hay mas de 4, para
+    que la dona y el total siempre sumen el total real, nunca se descarta silenciosamente),
+    y la dona es un pie real proporcional a esos valores.
+
+    family_deployment: lista (familia de OS, supported, unsupported) para CADA familia
+    presente (Windows/macOS/Linux/...), no solo la dominante -- comparar version de
+    conector solo tiene sentido dentro de la misma familia, pero ninguna familia debe
+    quedar fuera de Version Deployment solo porque no es la mayoritaria (si hay mas de 3
+    familias, el resto se agrupa en "Otras familias" en vez de perderse)."""
     img, d = d_draw_card_base("Devices")
 
     y0 = 210
@@ -2578,30 +2785,48 @@ def render_devices_card(top_os: str, supported: int, unsupported: int, outpath: 
     d_section_title(d, D_MARGIN, y0, "By Host")
     donut_cx = D_MARGIN + 210
     donut_cy = y0 + 230
-    d_draw_donut(d, donut_cx, donut_cy, 142, 86, D_COL_PURPLE)
+    rows = _condense_breakdown_with_other(top_os_breakdown, 4) if top_os_breakdown else [("Unknown OS", 0)]
+    d_draw_multi_donut(d, donut_cx, donut_cy, 142, 86, [count for _, count in rows])
 
-    d.rectangle([D_MARGIN + 430, y0 + 188, D_MARGIN + 472, y0 + 230], fill=D_COL_PURPLE)
-    d_label_linklike(d, D_MARGIN + 500, y0 + 176, top_os)
+    label_x = D_MARGIN + 500
+    swatch_x = D_MARGIN + 430
+    row_h = 66
+    y = y0 + 140
+    for i, (name, count) in enumerate(rows):
+        d.rectangle([swatch_x, y - 8, swatch_x + 42, y + 34], fill=D_OS_PALETTE[i % len(D_OS_PALETTE)])
+        d_label_linklike(d, label_x, y, f"{name} ({count})")
+        y += row_h
 
     VD_Y = y0 + 470
     d_section_title(d, D_MARGIN, VD_Y, "Version Deployment")
 
-    d_label_normal(d, D_MARGIN, VD_Y + 76, "Update Status", D_COL_TEXT)
+    # El total SIEMPRE se calcula sobre la lista completa (no la condensada), para que
+    # nunca quede una familia fuera del "Update Status" aunque no se le dedique fila propia.
+    total_sup = sum(s for _, s, _ in family_deployment)
+    total_uns = sum(u for _, _, u in family_deployment)
+    dep_rows = (
+        _condense_family_deployment_with_other(family_deployment, 3)
+        if family_deployment
+        else [("Unknown OS", 0, 0)]
+    )
 
-    d_label_linklike(d, D_MARGIN + 460, VD_Y + 76, f"{supported} Supported")
-    d.text((D_MARGIN + 1090, VD_Y + 76), f"{unsupported} Unsupported", fill=D_COL_YELLOW, font=D_FONT_BODY)
-
-    d_label_linklike(d, D_MARGIN, VD_Y + 164, "Windows")
+    d_label_normal(d, D_MARGIN, VD_Y + 60, "Update Status", D_COL_TEXT)
+    d_label_linklike(d, D_MARGIN + 460, VD_Y + 60, f"{total_sup} Supported")
+    d.text((D_MARGIN + 1090, VD_Y + 60), f"{total_uns} Unsupported", fill=D_COL_YELLOW, font=D_FONT_BODY)
 
     bar_x = D_MARGIN + 460
-    bar_y = VD_Y + 176
     bar_w = 1080
-    bar_h = 38
+    bar_h = 34
+    row_stride = 108
+    first_row_y = VD_Y + 130
 
-    d.rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], fill=(230, 230, 230))
-    d_draw_version_bar(d, bar_x, bar_y, bar_w, bar_h, supported, unsupported)
-
-    d_label_normal(d, bar_x + bar_w + 20, VD_Y + 160, f"{supported} / {unsupported}", D_COL_TEXT)
+    for i, (fam_name, sup_i, uns_i) in enumerate(dep_rows):
+        ry = first_row_y + i * row_stride
+        d_label_linklike(d, D_MARGIN, ry, fam_name)
+        bar_y = ry + 4
+        d.rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], fill=(230, 230, 230))
+        d_draw_version_bar(d, bar_x, bar_y, bar_w, bar_h, sup_i, uns_i)
+        d.text((bar_x + bar_w + 20, bar_y - 2), f"{sup_i} / {uns_i}", fill=D_COL_TEXT, font=D_FONT_BODY)
 
     if empty_note:
         d.text((D_MARGIN, D_CARD_H - 95), "No endpoints in this group", fill=D_COL_GRAY, font=D_FONT_BODY)
@@ -2657,6 +2882,7 @@ def amp_main():
 
     groups = amp.get_groups()
     allowed_amp = globals().get("AMP_ALLOWED_GROUPS_OVERRIDE")
+    device_group_aliases = globals().get("AMP_DEVICE_GROUP_ALIASES_OVERRIDE") or {}
     if allowed_amp is not None:
         before = len(groups)
         groups = _filter_existing_amp_groups(groups, allowed_amp)
@@ -2679,6 +2905,13 @@ def amp_main():
     membership_idx = build_group_membership_index(computers)
     print(f"✅ Group membership index built: {len(membership_idx)} group IDs con endpoints")
 
+    # Se cachean los eventos crudos y la carpeta de cada grupo para poder, en una segunda
+    # pasada, fusionar Compromises/Threats de grupos "hermanos" (mismo mecanismo que ya usa
+    # Devices) sin tener que volver a pedirlos a la API.
+    compromises_raw_by_guid: Dict[str, List[dict]] = {}
+    threats_raw_by_guid: Dict[str, List[dict]] = {}
+    out_dir_by_guid: Dict[str, str] = {}
+
     for g in groups:
         gname = g["name"]
         gguid = g["guid"]
@@ -2686,6 +2919,7 @@ def amp_main():
         safe_name = sanitize_folder(gname)
         out_dir = os.path.join(out_root, safe_name)
         ensure_dir(out_dir)
+        out_dir_by_guid[gguid] = out_dir
 
         # 1) COMPROMISES -> compromises.png
         try:
@@ -2701,6 +2935,7 @@ def amp_main():
                 retries=3,
                 base_sleep=4.0,
             )
+            compromises_raw_by_guid[gguid] = events_in_range
             compromise_events = filter_compromise_events(events_in_range)
             if not compromise_events:
                 if events_in_range:
@@ -2724,6 +2959,7 @@ def amp_main():
                 retries=3,
                 base_sleep=4.0,
             )
+            threats_raw_by_guid[gguid] = events_thr
             threats = build_unique_threats_by_detection_id(events_thr)
             if not threats:
                 if events_thr:
@@ -2740,31 +2976,80 @@ def amp_main():
 
         # 3) DEVICES -> devices.png
         try:
-            endpoints = membership_idx.get(gguid, [])
+            endpoints = resolve_merged_device_endpoints(gname, gguid, groups, membership_idx, device_group_aliases)
             if not endpoints and not GENERATE_EMPTY_GROUPS:
                 print(f"⏭️ {gname}: sin endpoints (skip devices)")
             else:
                 os_buckets = [d_parse_os_bucket(c.get("operating_system")) for c in endpoints]
-                os_counts = d_count_top(os_buckets)
-                top_os = os_counts[0][0] if os_counts else "Unknown OS"
+                os_breakdown = d_count_top(os_buckets)
 
-                windows_eps = [c for c in endpoints if d_parse_os_bucket(c.get("operating_system")).lower().startswith("windows")]
-                sup, uns, baseline = compute_supported_unsupported_baseline(windows_eps)
+                families = [d_os_family(b) for b in os_buckets]
+                family_deployment = []
+                for fam_name, _ in d_count_top(families):
+                    fam_eps = [c for c, fam in zip(endpoints, families) if fam == fam_name]
+                    sup_i, uns_i, _baseline_i = compute_supported_unsupported_baseline(fam_eps)
+                    family_deployment.append((fam_name, sup_i, uns_i))
 
                 out_img_dev = os.path.join(out_dir, "devices.png")
                 render_devices_card(
-                    top_os=top_os,
-                    supported=sup,
-                    unsupported=uns,
+                    top_os_breakdown=os_breakdown,
+                    family_deployment=family_deployment,
                     outpath=out_img_dev,
                     empty_note=(len(endpoints) == 0),
                 )
 
-                print(f"✅ {gname}: devices endpoints={len(endpoints)} windows={len(windows_eps)} sup={sup} uns={uns} -> {out_img_dev}")
+                print(
+                    f"✅ {gname}: devices endpoints={len(endpoints)} breakdown={os_breakdown[:4]} "
+                    f"family_deployment={family_deployment[:3]} -> {out_img_dev}"
+                )
         except Exception as e:
             print(f"⚠️ {gname}: error devices ({e})")
 
         time.sleep(GROUP_THROTTLE_SECONDS)
+
+    # Segunda pasada: para grupos con "hermanos" (subgrupos USB BLOCK que Cisco separo del
+    # padre, o razones sociales con endpoints repartidos en varios grupos AMP declarados en
+    # amp_related_names), fusionar los eventos crudos ya obtenidos y re-renderizar
+    # compromises.png / threats.png del grupo principal con el dato combinado -- igual
+    # mecanismo que ya se aplica a Devices, para que un target no quede con "0 Compromises"
+    # solo porque su grupo principal en Cisco no tiene actividad propia mientras sus
+    # grupos hermanos si la tienen.
+    for g in groups:
+        gname = g["name"]
+        gguid = g["guid"]
+        related_guids = resolve_related_group_guids(gname, gguid, groups, device_group_aliases)
+        if len(related_guids) <= 1:
+            continue
+
+        out_dir = out_dir_by_guid.get(gguid)
+        if not out_dir:
+            continue
+
+        try:
+            merged_raw_compromises = _dedupe_events_by_id(
+                [ev for guid in related_guids for ev in compromises_raw_by_guid.get(guid, [])]
+            )
+            merged_compromise_events = filter_compromise_events(merged_raw_compromises)
+            render_compromises_card(merged_compromise_events, os.path.join(out_dir, "compromises.png"))
+            print(
+                f"🔗 {gname}: compromises fusionado con {len(related_guids) - 1} grupo(s) hermano(s) "
+                f"-> {len(merged_compromise_events)}"
+            )
+        except Exception as e:
+            print(f"⚠️ {gname}: error fusionando compromises ({e})")
+
+        try:
+            merged_raw_threats = _dedupe_events_by_id(
+                [ev for guid in related_guids for ev in threats_raw_by_guid.get(guid, [])]
+            )
+            merged_threats = build_unique_threats_by_detection_id(merged_raw_threats)
+            render_threats_card(merged_threats, os.path.join(out_dir, "threats.png"))
+            print(
+                f"🔗 {gname}: threats fusionado con {len(related_guids) - 1} grupo(s) hermano(s) "
+                f"-> {len(merged_threats)}"
+            )
+        except Exception as e:
+            print(f"⚠️ {gname}: error fusionando threats ({e})")
 
     print(f"✅ Listo. Carpeta final: {out_root}")
 

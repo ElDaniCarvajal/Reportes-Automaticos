@@ -1,4 +1,6 @@
 # Inventarios generados por export_amp_tenable_groups.py
 group_inventory/
-Argentina_servicios de ciberseguridad_marzo 2026.docx
-Argentina_servicios de ciberseguridad_abril 2026.docx
+
+# Reportes generados
+Argentina_servicios de ciberseguridad_*.docx
+reportes_finales_docx/
